@@ -17,6 +17,24 @@ if(/^#(s|t|v)=/.test(location.hash) || /[?&]sign(=|&|$)/.test(location.search)){
 <script>/* (added) Client Fill-In link: hide the system from the first byte; the fill-in form replaces the page when it loads. */
 if(/^#f=/.test(location.hash) && /[?&]fill(=|&|$)/.test(location.search)){ document.documentElement.style.visibility = "hidden"; document.documentElement.style.background = "#EEF2F6"; }
 </script>
+<script>/* (added) No jump on opening: on a slower computer the browser draws this large page while it is still
+ * loading, so the screens show in their raw, unarranged form (it looks like an older version) and then
+ * jump when the scripts at the end arrange them. Keep the page covered by a plain "Opening..." screen
+ * until everything is arranged, then show it in one step. Client links keep their own handling above. */
+(function(){
+  if(/^#(s|t|v|f)=/.test(location.hash) || /[?&](sign|fill)(=|&|$)/.test(location.search)) return;
+  var st = document.createElement("style"); st.id = "cwOpening";
+  st.textContent = "html{background:#EEF2F6 !important}body{visibility:hidden !important}" +
+    "html::after{content:'Opening Master Management System\\2026';position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font:600 16px system-ui,Arial,sans-serif;color:#12355B;background:#EEF2F6;z-index:2147483647}";
+  document.head ? document.head.appendChild(st) : document.documentElement.appendChild(st);
+  var shown = false;
+  function show(){ if(shown) return; shown = true; var s = document.getElementById("cwOpening"); if(s && s.parentNode) s.parentNode.removeChild(s); }
+  function ready(){ requestAnimationFrame(function(){ setTimeout(show, 60); }); }
+  if(document.readyState === "loading") document.addEventListener("DOMContentLoaded", ready); else ready();
+  window.addEventListener("load", show);
+  setTimeout(show, 15000);   // never stays covered, even if something goes wrong
+})();
+</script>
 <!-- Home-screen / "app mode" support: once this file is opened from a real https:// address
      (not required just to view it, but required for these to actually kick in — see the
      explanation given alongside this file), Add to Home Screen on iOS or Android launches it
