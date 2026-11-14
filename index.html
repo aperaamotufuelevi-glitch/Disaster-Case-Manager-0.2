@@ -32953,7 +32953,8 @@ try{ fpgqInit(); }catch(e){ console.error("FPG quick fill", e); }
     client acknowledgment), printable receipt and payment log, CSV export.
   - Semi-automatic: "Send a Payment" — copy amount / Zelle phone / Zelle email / memo, open your
     own bank's website or app, then enter the bank confirmation number and mark it Sent.
-    The money itself is always sent by you inside your own bank's app or website.
+    Pay with Cash App / Venmo / PayPal buttons open that app with the client and amount filled in.
+    The money itself is always sent by you inside your own bank's or app's screen.
   - Locked: passcode, then a one-time 6-digit code emailed through the EmailJS that is already
     set up in Settings. The code works once and expires in 10 minutes. Auto-locks when idle.
   - Everything in this tab is stored ENCRYPTED in this browser (AES-256, key from your passcode).
@@ -33069,6 +33070,17 @@ function targets(){
   var out = [];
   try{ if(typeof cflTargets === "function") return cflTargets().map(function(t){ return {key:(t.kind === "dcm" ? "dcm|" + t.caseId : "apx|" + t.pid + "|" + t.key), kind:t.kind, caseId:t.caseId || "", ref:t.id, name:t.name || "", phone:t.phone || "", email:t.email || "", program:t.program || ""}; }); }catch(e){}
   try{ allSavedCases().forEach(function(c){ if(c && c.caseId) out.push({key:"dcm|" + c.caseId, kind:"dcm", caseId:c.caseId, ref:c.caseId, name:(c.primary || {}).fullName || "", phone:(c.primary || {}).phoneCell || "", email:(c.primary || {}).email || "", program:"Disaster Case Manager"}); }); }catch(e){}
+  return out;
+}
+function handle(v){ return String(v || "").trim().replace(/^[$@]+/, "").replace(/^https?:\/\/\S*\//i, "").replace(/[^A-Za-z0-9_.\-]/g, ""); }
+function appLinks(p){
+  var amt = (Math.round((Number(p.amount) || 0) * 100) / 100).toFixed(2), out = [];
+  var ca = handle(p.cashtag), vm = handle(p.venmo), pp = handle(p.paypal);
+  if(ca) out.push({k:"cashapp", label:"Pay with Cash App", who:"$" + ca, url:"https://cash.app/$" + encodeURIComponent(ca) + "/" + amt});
+  if(vm) out.push({k:"venmo", label:"Pay with Venmo", who:"@" + vm, url:"https://venmo.com/" + encodeURIComponent(vm) + "?txn=pay&audience=private&amount=" + amt + "&note=" + encodeURIComponent(p.id)});
+  if(pp) out.push({k:"paypal", label:"Pay with PayPal", who:"paypal.me/" + pp, url:"https://paypal.me/" + encodeURIComponent(pp) + "/" + amt});
+  var m = String(p.method || "").toUpperCase(), first = /CASH ?APP/.test(m) ? "cashapp" : /VENMO/.test(m) ? "venmo" : /PAYPAL/.test(m) ? "paypal" : "";
+  out.sort(function(a, b){ return (b.k === first) - (a.k === first); });
   return out;
 }
 function stCls(s){ s = String(s || ""); return /^PENDING/.test(s) ? "p" : s === "SENT" ? "s" : /^RECEIVED/.test(s) ? "r" : "x"; }
@@ -33217,7 +33229,7 @@ function doErase(){
 function formFrom(p){
   var s = settings();
   return p ? JSON.parse(JSON.stringify(p)) : {id:"", caseKey:"", caseRef:"", caseKind:"", caseId:"", program:"", client:"", clientPhone:"", payee:"", date:today(), amount:"", purpose:"", source:s.sources[0] || "",
-    method:s.methods[0] || "", bank:"", acctType:"CHECKING", last4:"", zPhone:"", zEmail:"", status:STATUSES[0], conf:"", sentDate:"", ack:"NOT YET", ackDate:"", notes:""};
+    method:s.methods[0] || "", bank:"", acctType:"CHECKING", last4:"", zPhone:"", zEmail:"", cashtag:"", venmo:"", paypal:"", status:STATUSES[0], conf:"", sentDate:"", ack:"NOT YET", ackDate:"", notes:""};
 }
 function readForm(){
   var f = S.form; if(!f) return;
@@ -33233,6 +33245,7 @@ function savePayment(){
   f.amount = (Math.round(Number(f.amount) * 100) / 100).toFixed(2);
   ["client","payee","notes","conf","bank","purpose","source","method"].forEach(function(k){ f[k] = up(f[k]).trim(); });
   if(!f.payee) f.payee = f.client;
+  f.cashtag = handle(f.cashtag); f.venmo = handle(f.venmo); f.paypal = handle(f.paypal);
   var now = new Date().toISOString();
   if(!f.id){ f.id = newId(); f.created = now; f.history = [{t:now, ev:"Recorded (" + f.status + ")"}]; S.data.payments.unshift(f); }
   else {
@@ -33254,7 +33267,7 @@ function deletePayment(id){
 function markSent(){
   var p = findPay(S.sendId); if(!p) return;
   var conf = up((($("cwpConf") || {}).value || "").trim()), d = ($("cwpSentDate") || {}).value || today();
-  if(!conf){ S.bad = "Type the confirmation or reference number your bank gave you (it proves the payment was sent)."; return render(); }
+  if(!conf){ S.bad = "Type the confirmation or transaction number your bank or the app gave you (it proves the payment was sent)."; return render(); }
   var now = new Date().toISOString();
   p.status = "SENT"; p.conf = conf; p.sentDate = d; p.updated = now; p.history = p.history || []; p.history.push({t:now, ev:"Marked Sent — confirmation " + conf});
   if(settings().caseNote === "yes" && p.caseKind === "dcm" && p.caseId && typeof calUpdateCase === "function"){
@@ -33420,6 +33433,10 @@ function renderForm(){
     '<div class="field-note" style="margin:-4px 0 8px;">Never type the full account number here. The full number stays in your bank app only.</div><div class="row">' +
     '<div class="field"><label for="cwpZPhone">Zelle phone (if paying by Zelle)</label><input type="tel" id="cwpZPhone" data-f="zPhone" value="' + E(f.zPhone) + '"></div>' +
     '<div class="field"><label for="cwpZEmail">Zelle email (if paying by Zelle)</label><input type="email" id="cwpZEmail" data-f="zEmail" value="' + E(f.zEmail) + '"></div></div><div class="row">' +
+    '<div class="field"><label for="cwpCashtag">Client&rsquo;s Cash App $Cashtag (username)</label><input type="text" id="cwpCashtag" data-f="cashtag" autocomplete="off" spellcheck="false" placeholder="$Cashtag" value="' + E(f.cashtag ? "$" + handle(f.cashtag) : "") + '"></div>' +
+    '<div class="field"><label for="cwpVenmo">Client&rsquo;s Venmo username</label><input type="text" id="cwpVenmo" data-f="venmo" autocomplete="off" spellcheck="false" placeholder="@username" value="' + E(f.venmo ? "@" + handle(f.venmo) : "") + '"></div>' +
+    '<div class="field"><label for="cwpPaypal">Client&rsquo;s PayPal.Me username</label><input type="text" id="cwpPaypal" data-f="paypal" autocomplete="off" spellcheck="false" placeholder="paypal.me/username" value="' + E(f.paypal) + '"></div></div>' +
+    '<div class="field-note" style="margin:-4px 0 8px;">Fill in only what the client uses. The Send a Payment screen then opens that app with the client and the amount already filled in.</div><div class="row">' +
     '<div class="field"><label for="cwpStatus">Status</label><select id="cwpStatus" data-f="status">' + opts(STATUSES, f.status) + '</select></div>' +
     '<div class="field"><label for="cwpConfF">Bank confirmation No.</label><input type="text" id="cwpConfF" data-f="conf" value="' + E(f.conf) + '"></div>' +
     '<div class="field"><label for="cwpSentF">Date sent</label><input type="date" id="cwpSentF" data-f="sentDate" value="' + E(f.sentDate) + '"></div></div><div class="row">' +
@@ -33461,16 +33478,19 @@ function renderSend(){
   h += '<fieldset><legend>Step 1 — Copy the details</legend><div class="cwp-big">' + money(p.amount) + '</div><table class="cwp-kv">' +
     '<tr><td>Pay to</td><td><b>' + E(p.payee || p.client) + '</b></td></tr><tr><td>Method</td><td>' + E(p.method) + '</td></tr>' +
     (p.zPhone ? '<tr><td>Zelle phone</td><td>' + E(phoneFmt(p.zPhone)) + '</td></tr>' : '') + (p.zEmail ? '<tr><td>Zelle email</td><td>' + E(p.zEmail) + '</td></tr>' : '') +
+    (p.cashtag ? '<tr><td>Cash App</td><td>$' + E(handle(p.cashtag)) + '</td></tr>' : '') + (p.venmo ? '<tr><td>Venmo</td><td>@' + E(handle(p.venmo)) + '</td></tr>' : '') + (p.paypal ? '<tr><td>PayPal</td><td>paypal.me/' + E(handle(p.paypal)) + '</td></tr>' : '') +
     (p.bank || p.last4 ? '<tr><td>Client&rsquo;s bank</td><td>' + E(p.bank) + ' ' + E(p.acctType) + (p.last4 ? ' ending in ' + E(p.last4) : '') + '</td></tr>' : '') +
     '<tr><td>Memo</td><td>' + E(memo) + '</td></tr><tr><td>Case</td><td>' + E(p.caseRef + " — " + p.client) + '</td></tr></table>' +
     '<div class="esg-btns" style="margin-top:8px;"><button type="button" data-cwp="cp" data-arg="amount">Copy amount</button>' +
     (p.zPhone ? '<button type="button" data-cwp="cp" data-arg="zphone">Copy Zelle phone</button>' : '') + (p.zEmail ? '<button type="button" data-cwp="cp" data-arg="zemail">Copy Zelle email</button>' : '') +
     '<button type="button" data-cwp="cp" data-arg="payee">Copy name</button><button type="button" data-cwp="cp" data-arg="memo">Copy memo</button></div></fieldset>' +
-    '<fieldset><legend>Step 2 — Send it in your bank</legend>' +
+    '<fieldset><legend>Step 2 — Send it</legend>' +
+    (function(){ var L = appLinks(p); return L.length ? '<div class="esg-btns" style="margin-bottom:8px;">' + L.map(function(a, i){ return '<a class="btn-like" style="' + (i === 0 ? 'background:var(--navy,#12355B);color:#fff;' : '') + '" href="' + E(a.url) + '" target="_blank" rel="noopener" data-cwp-app="' + a.k + '">' + E(a.label) + ' — ' + money(p.amount) + ' to ' + E(a.who) + '</a>'; }).join("") + '</div>' +
+      '<p class="field-note" style="margin-bottom:8px;">The app opens with the client and the amount filled in. Check that the name and photo are the right person, then press Pay in the app.' + (L.some(function(a){ return a.k === "cashapp"; }) ? ' Cash App does not fill in the note; paste the memo if you want one.' : '') + '</p>' : ''; })() +
     (s.myBank.url ? '<a class="btn-like" href="' + E(s.myBank.url) + '" target="_blank" rel="noopener">Open My Bank' + (s.myBank.name ? ' — ' + E(s.myBank.name) : '') + '</a>' : '<span class="field-note">No bank link saved yet (Settings in this tab).</span>') +
-    '<p class="field-note" style="margin-top:6px;">Sign in to your bank, send ' + money(p.amount) + ' to ' + E(p.payee || p.client) + ', and paste the memo. Check the name and amount before you press Send in the bank app.</p></fieldset>' +
+    '<p class="field-note" style="margin-top:6px;">For Zelle or a bank transfer: sign in to your bank, send ' + money(p.amount) + ' to ' + E(p.payee || p.client) + ', and paste the memo. Check the name and amount before you press Send in the bank app.</p></fieldset>' +
     '<fieldset><legend>Step 3 — Record the confirmation</legend><div class="row">' +
-    '<div class="field"><label for="cwpConf">Bank confirmation No.</label><input type="text" id="cwpConf" autocomplete="off"></div>' +
+    '<div class="field"><label for="cwpConf">Confirmation or transaction No. (from the bank or app)</label><input type="text" id="cwpConf" autocomplete="off"></div>' +
     '<div class="field"><label for="cwpSentDate">Date sent</label><input type="date" id="cwpSentDate" value="' + today() + '"></div></div>' +
     '<button type="button" class="primary" data-cwp="marksent">Mark as Sent</button>' +
     (s.caseNote === "yes" && p.caseKind === "dcm" ? ' <span class="field-note">A line will be added to this case&rsquo;s Case Manager Comments.</span>' : '') + '</fieldset>';
@@ -33522,11 +33542,15 @@ function render(){
 function onPick(e){
   var v = $("viewClientPayments"); if(!v || !v.contains(e.target)) return;
   var sg = e.target.closest("[data-cwp-pick]");
-  if(sg){ e.preventDefault(); var t = S.sugg[+sg.getAttribute("data-cwp-pick")]; if(t && S.form){ readForm(); S.form.caseKey = t.key; S.form.caseKind = t.kind; S.form.caseId = t.caseId; S.form.caseRef = t.ref; S.form.program = t.program; S.form.client = up(t.name); if(!S.form.payee) S.form.payee = up(t.name); S.form.clientPhone = t.phone; } S.sugg = []; render(); return; }
+  if(sg){ e.preventDefault(); var t = S.sugg[+sg.getAttribute("data-cwp-pick")]; if(t && S.form){ readForm(); S.form.caseKey = t.key; S.form.caseKind = t.kind; S.form.caseId = t.caseId; S.form.caseRef = t.ref; S.form.program = t.program; S.form.client = up(t.name); if(!S.form.payee) S.form.payee = up(t.name); S.form.clientPhone = t.phone;
+      var last = payments().filter(function(x){ return x.caseKey === t.key && x.id !== S.form.id; })[0];
+      if(last) ["payee","bank","acctType","last4","zPhone","zEmail","cashtag","venmo","paypal","method"].forEach(function(k){ if(!S.form[k] || k === "payee" || k === "method") S.form[k] = last[k] || S.form[k]; });
+    } S.sugg = []; render(); return; }
   var box = $("cwpSugg"); if(box && !e.target.closest("#cwpSugg, #cwpCaseSearch")) box.style.display = "none";
 }
 function onClick(e){
   var v = $("viewClientPayments"); if(!v || !v.contains(e.target)) return;
+  var ap = e.target.closest("[data-cwp-app]"); if(ap){ log("Opened " + ap.getAttribute("data-cwp-app") + " for " + (S.sendId || "")); return; }
   var b = e.target.closest("[data-cwp]"); if(!b) return;
   var a = b.getAttribute("data-cwp"), arg = b.getAttribute("data-arg");
   if(a !== "cp") { S.msg = ""; S.bad = ""; }
