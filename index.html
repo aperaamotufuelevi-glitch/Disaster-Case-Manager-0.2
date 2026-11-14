@@ -32957,7 +32957,8 @@ try{ fpgqInit(); }catch(e){ console.error("FPG quick fill", e); }
   - Locked: passcode, then a one-time 6-digit code emailed through the EmailJS that is already
     set up in Settings. The code works once and expires in 10 minutes. Auto-locks when idle.
   - Everything in this tab is stored ENCRYPTED in this browser (AES-256, key from your passcode).
-    A recovery key (shown once at setup) can reset a forgotten passcode.
+    No recovery key: a forgotten passcode is reset with a one-time code emailed to you; this
+    browser keeps its own unlock key (non-exportable, in IndexedDB) for that reset.
  Nothing existing is edited: this block only reads existing helpers (switchView, ailCfg,
  remSend, cflTargets/allSavedCases, currentOrgProfile, calUpdateCase) and adds a menu button.
  ======================================================================================
@@ -32976,7 +32977,7 @@ var DEFAULTS = {
   autoLock:10, caseNote:"no"
 };
 var S = {unlocked:false, dk:null, pend:null, data:null, step:"pass", mode:"", tab:"list", form:null, sendId:null,
-         msg:"", bad:"", showRec:"", lastAct:0, q:"", f:"", sugg:[], chain:Promise.resolve()};
+         msg:"", bad:"", lastAct:0, q:"", f:"", sugg:[], chain:Promise.resolve()};
 
 /* ---------- small helpers (own copies, so nothing existing is touched) ---------- */
 function $(id){ return document.getElementById(id); }
@@ -33020,8 +33021,17 @@ function codeHash(code, salt){
 }
 function sixDigits(){ var a = new Uint32Array(1); crypto.getRandomValues(a); return ("000000" + (a[0] % 1000000)).slice(-6); }
 var RA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-function recKey(){ var r = rnd(20), s = ""; for(var i = 0; i < 20; i++){ s += RA[r[i] % RA.length]; if(i % 5 === 4 && i < 19) s += "-"; } return s; }
-function recNorm(s){ return String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, ""); }
+/* This browser's own unlock key (cannot be copied out of the browser). Used only for "Forgot passcode",
+   after the one-time code from your email is confirmed. */
+function idb(){ return new Promise(function(res, rej){ var r = indexedDB.open("cwpay_keys", 1); r.onupgradeneeded = function(){ r.result.createObjectStore("k"); }; r.onsuccess = function(){ res(r.result); }; r.onerror = function(){ rej(r.error); }; }); }
+function devGet(){ return idb().then(function(db){ return new Promise(function(res, rej){ var q = db.transaction("k", "readonly").objectStore("k").get("device"); q.onsuccess = function(){ res(q.result || null); }; q.onerror = function(){ rej(q.error); }; }); }); }
+function devNew(){ return crypto.subtle.generateKey({name:"AES-GCM", length:256}, false, ["encrypt", "decrypt"]).then(function(k){ return idb().then(function(db){ return new Promise(function(res, rej){ var t = db.transaction("k", "readwrite"); t.objectStore("k").put(k, "device"); t.oncomplete = function(){ res(k); }; t.onerror = function(){ rej(t.error); }; }); }); }); }
+/** Makes sure this browser can reset the passcode later (called whenever the passcode is proven). */
+function devEnsure(raw){
+  var st = load(); if(!st) return Promise.resolve();
+  var reseal = function(){ return devNew().then(function(k){ return seal(k, raw); }).then(function(w){ var s2 = load(); if(s2){ s2.wrapD = w; delete s2.wrapR; delete s2.salt2; save(s2); } }); };
+  return devGet().then(function(k){ return (k && st.wrapD) ? unseal(k, st.wrapD).then(function(){ if(st.wrapR){ delete st.wrapR; delete st.salt2; save(st); } }, reseal) : reseal(); }).catch(function(e){ console.error("Client Payments device key", e); });
+}
 function weakPass(p){
   if(String(p).length < 6) return "Use at least 6 characters.";
   if(/^(.)\1+$/.test(p)) return "That passcode is too easy to guess (all the same character).";
@@ -33076,14 +33086,16 @@ function doSetup(){
   if(!validEmail(to)){ S.bad = "Type the email address where your one-time codes should go."; return render(); }
   if(!emailReady()){ S.bad = "EmailJS is not set up yet. Fill in the EmailJS details in Settings first."; return render(); }
   S.bad = ""; S.msg = "Setting up&hellip;"; render();
-  var raw = rnd(32), salt = rnd(16), salt2 = rnd(16), rec = recKey();
+  var raw = rnd(32), salt = rnd(16);
   var data = {v:1, payments:[], settings:JSON.parse(JSON.stringify(DEFAULTS))};
-  Promise.all([kek(p1, salt), kek(recNorm(rec), salt2), dkImport(raw)]).then(function(k){
-    return Promise.all([seal(k[0], raw), seal(k[1], raw), seal(k[2], te.encode(JSON.stringify(data)))]);
+  Promise.all([kek(p1, salt), dkImport(raw)]).then(function(k){
+    return Promise.all([seal(k[0], raw), seal(k[1], te.encode(JSON.stringify(data)))]);
   }).then(function(w){
-    save({v:1, iter:ITER, salt:b64(salt), salt2:b64(salt2), wrapP:w[0], wrapR:w[1], data:w[2], created:new Date().toISOString()});
+    save({v:1, iter:ITER, salt:b64(salt), wrapP:w[0], data:w[1], created:new Date().toISOString()});
+    return devEnsure(raw);
+  }).then(function(){
     var p = pub(); p.to = to; p.fails = 0; p.coolUntil = 0; savePub(p); log("Client Payments was set up");
-    S.showRec = rec; S.msg = ""; render();
+    S.step = "pass"; S.msg = "Set up is done. Type your passcode to open Client Payments."; render();
   }).catch(function(e){ console.error(e); S.msg = ""; S.bad = "This browser could not set up the lock. Open the system in an up-to-date Chrome."; render(); });
 }
 function doPass(){
@@ -33092,9 +33104,9 @@ function doPass(){
   if(Date.now() < p.coolUntil){ S.bad = "Too many wrong passcodes. Try again in " + Math.ceil((p.coolUntil - Date.now()) / 60000) + " minute(s)."; return render(); }
   if(!pass){ S.bad = "Type your passcode."; return render(); }
   S.bad = ""; S.msg = "Checking&hellip;"; render();
-  kek(pass, unb64(st.salt)).then(function(k){ return unseal(k, st.wrapP); }).then(dkImport).then(function(dk){
+  kek(pass, unb64(st.salt)).then(function(k){ return unseal(k, st.wrapP); }).then(function(raw){ return devEnsure(raw).then(function(){ return dkImport(raw); }); }).then(function(dk){
     var p2 = pub(); p2.fails = 0; savePub(p2);
-    S.pend = dk; S.msg = ""; sendCode(false);
+    S.pend = dk; S.msg = ""; sendCode(false, "open");
   }).catch(function(){
     var p2 = pub(); p2.fails++; var left = PASS_TRIES - p2.fails;
     if(p2.fails >= PASS_TRIES){ p2.fails = 0; p2.coolUntil = Date.now() + COOL_MS; savePub(p2); log("5 wrong passcodes — locked for 5 minutes");
@@ -33104,22 +33116,28 @@ function doPass(){
     S.msg = ""; render();
   });
 }
-function sendCode(force){
-  var st = load(), o = st && st.otp;
-  if(!force && o && Date.now() < o.exp){ S.step = "otp"; S.msg = "A code was already sent to " + E(maskEmail(sendTo())) + ". Use that code, or press <b>Send a new code</b>."; return render(); }
-  if(force && o && Date.now() - o.sent < RESEND_MS){ S.step = "otp"; S.bad = "Please wait a minute before sending another code."; return render(); }
+function sendCode(force, purpose){
+  purpose = purpose || "open";
+  var reset = purpose === "reset", st = load(), o = st && st.otp, same = o && (o.purpose || "open") === purpose;
+  var place = function(){ if(!reset) S.step = "otp"; };
+  if(!force && same && Date.now() < o.exp){ place(); S.msg = "A code was already sent to " + E(maskEmail(sendTo())) + ". Use that code, or press <b>Send a new code</b>."; return render(); }
+  if(force && o && Date.now() - o.sent < RESEND_MS){ place(); S.bad = "Please wait a minute before sending another code."; return render(); }
   var code = sixDigits(), salt = b64(rnd(16));
-  S.step = "otp"; S.bad = ""; S.msg = "Sending your one-time code&hellip;"; render();
+  place(); S.bad = ""; S.msg = "Sending your one-time code&hellip;"; render();
   codeHash(code, salt).then(function(h){
-    var body = "Your one-time access code for Client Payments is: " + code + "\n\n" +
-      "It works only once and expires in " + OTP_MIN + " minutes.\n\n" +
-      "If you did not try to open Client Payments, someone may know your passcode. Change it in Client Payments > Settings.";
-    return mail("[Client Payments] Your one-time access code", body).then(function(res){
+    var body = reset
+      ? "Your one-time code to reset the Client Payments passcode is: " + code + "\n\n" +
+        "It works only once and expires in " + OTP_MIN + " minutes.\n\n" +
+        "If you did not ask to reset the passcode, do not use this code."
+      : "Your one-time access code for Client Payments is: " + code + "\n\n" +
+        "It works only once and expires in " + OTP_MIN + " minutes.\n\n" +
+        "If you did not try to open Client Payments, someone may know your passcode. Change it in Client Payments > Settings.";
+    return mail(reset ? "[Client Payments] Code to reset your passcode" : "[Client Payments] Your one-time access code", body).then(function(res){
       var st2 = load(); if(!st2) return;
       if(res && res.ok){
-        st2.otp = {hash:h, salt:salt, exp:Date.now() + OTP_MIN * 60000, sent:Date.now(), tries:0}; save(st2);
-        log("One-time code sent to " + maskEmail(sendTo()));
-        S.msg = "A one-time code was sent to <b>" + E(maskEmail(sendTo())) + "</b>. Type it below and press <b>Access</b>.";
+        st2.otp = {hash:h, salt:salt, exp:Date.now() + OTP_MIN * 60000, sent:Date.now(), tries:0, purpose:purpose}; save(st2);
+        log((reset ? "Passcode reset code" : "One-time code") + " sent to " + maskEmail(sendTo()));
+        S.msg = "A one-time code was sent to <b>" + E(maskEmail(sendTo())) + "</b>. " + (reset ? "Type it below with your new passcode." : "Type it below and press <b>Access</b>.");
       } else {
         S.msg = ""; S.bad = "The code email did not send" + (res && res.err ? " (" + E(String(res.err).slice(0, 120)) + ")" : "") + ". Check the EmailJS details in Settings, then press Send a new code.";
       }
@@ -33131,7 +33149,7 @@ function doAccess(){
   var code = (($("cwpOtp") || {}).value || "").replace(/\D/g, ""), st = load();
   if(!S.pend){ S.step = "pass"; S.bad = "Type your passcode first."; return render(); }
   var o = st && st.otp;
-  if(!o){ S.bad = "No code is waiting. Press Send a new code."; return render(); }
+  if(!o || (o.purpose || "open") !== "open"){ S.bad = "No code is waiting. Press Send a new code."; return render(); }
   if(Date.now() > o.exp){ delete st.otp; save(st); log("One-time code expired"); S.msg = ""; S.bad = "That code expired (10 minutes). Press Send a new code."; return render(); }
   if(code.length !== 6){ S.bad = "Type the 6-digit code from the email."; return render(); }
   codeHash(code, o.salt).then(function(h){
@@ -33151,25 +33169,47 @@ function doAccess(){
   }).catch(function(e){ console.error(e); S.bad = "Client Payments could not be opened on this browser."; render(); });
 }
 function doForgot(){
-  var rec = recNorm(($("cwpRec") || {}).value), p1 = ($("cwpF1") || {}).value || "", p2 = ($("cwpF2") || {}).value || "", st = load();
-  if(rec.length !== 20){ S.bad = "Type the full 20-character recovery key."; return render(); }
+  var code = (($("cwpRCode") || {}).value || "").replace(/\D/g, ""), p1 = ($("cwpF1") || {}).value || "", p2 = ($("cwpF2") || {}).value || "", st = load();
+  var o = st && st.otp;
+  if(!o || o.purpose !== "reset"){ S.bad = "Press <b>Email me a code</b> first."; return render(); }
+  if(Date.now() > o.exp){ delete st.otp; save(st); S.bad = "That code expired (10 minutes). Press Email me a code again."; return render(); }
+  if(code.length !== 6){ S.bad = "Type the 6-digit code from the email."; return render(); }
   var w = weakPass(p1); if(w){ S.bad = w; return render(); }
   if(p1 !== p2){ S.bad = "The two new passcodes do not match."; return render(); }
   S.bad = ""; S.msg = "Checking&hellip;"; render();
-  var salt = rnd(16);
-  kek(rec, unb64(st.salt2)).then(function(k){ return unseal(k, st.wrapR); }).then(function(raw){
-    return kek(p1, salt).then(function(k2){ return seal(k2, raw); });
-  }).then(function(wrapP){
-    var st2 = load(); st2.salt = b64(salt); st2.wrapP = wrapP; delete st2.otp; save(st2);
-    log("Passcode reset with the recovery key"); notice("Passcode was reset", "The Client Payments passcode was reset with the recovery key.\n\nIf this was not you, make a new recovery key and change the passcode right away.");
-    S.mode = ""; S.step = "pass"; S.msg = "Your new passcode is set. Type it below to continue."; render();
-  }).catch(function(){ S.msg = ""; S.bad = "That recovery key is not right."; render(); });
+  codeHash(code, o.salt).then(function(h){
+    var st2 = load(), o2 = st2 && st2.otp;
+    if(!o2 || o2.purpose !== "reset"){ S.msg = ""; S.bad = "Press Email me a code first."; return render(); }
+    if(h !== o2.hash){
+      o2.tries = (o2.tries || 0) + 1;
+      if(o2.tries >= OTP_TRIES){ delete st2.otp; save(st2); log("Reset code cancelled after 5 wrong tries"); S.bad = "Wrong code 5 times. That code is cancelled. Press Email me a code again."; }
+      else { save(st2); S.bad = "Wrong code. " + (OTP_TRIES - o2.tries) + " tries left."; }
+      S.msg = ""; return render();
+    }
+    delete st2.otp; save(st2);              // used once — gone
+    return devGet().then(function(k){
+      if(!k || !st2.wrapD) throw new Error("nodev");
+      return unseal(k, st2.wrapD);
+    }).then(function(raw){
+      var salt = rnd(16);
+      return kek(p1, salt).then(function(k2){ return seal(k2, raw); }).then(function(wrapP){
+        var st3 = load(); st3.salt = b64(salt); st3.wrapP = wrapP; save(st3);
+        var pp = pub(); pp.fails = 0; pp.coolUntil = 0; savePub(pp);
+        log("Passcode reset with an emailed code"); notice("Passcode was reset", "The Client Payments passcode was reset with a one-time code sent to this email.\n\nIf this was not you, change the passcode right away.");
+        S.mode = ""; S.step = "pass"; S.msg = "Your new passcode is set. Type it below to continue."; render();
+      });
+    });
+  }).catch(function(e){
+    S.msg = "";
+    S.bad = (e && e.message === "nodev") ? "This browser no longer has its unlock key (the browser data was cleared), so the passcode cannot be reset here. Open it with your old passcode, restore a backup, or erase and start over." : "The passcode could not be reset on this browser.";
+    render();
+  });
 }
 function doErase(){
   var t = (($("cwpErase") || {}).value || "").trim().toUpperCase();
   if(t !== "ERASE"){ S.bad = "Type ERASE in the box to confirm."; return render(); }
-  localStorage.removeItem(KEY); log("All Client Payments records were erased (passcode and recovery key were lost)");
-  notice("All records erased", "All Client Payments records on this browser were erased because the passcode and recovery key were lost.");
+  localStorage.removeItem(KEY); log("All Client Payments records were erased");
+  notice("All records erased", "All Client Payments records on this browser were erased.");
   S.mode = ""; S.step = "pass"; S.msg = "Erased. You can set up Client Payments again."; S.bad = ""; render();
 }
 
@@ -33248,18 +33288,11 @@ function changePass(){
     .then(function(wrapP){ var st2 = load(); st2.salt = b64(salt); st2.wrapP = wrapP; save(st2); log("Passcode changed"); S.msg = "Passcode changed."; render(); })
     .catch(function(){ S.msg = ""; S.bad = "The current passcode is not right."; render(); });
 }
-function newRecovery(){
-  var cur = ($("cwpCurR") || {}).value || "", st = load(), rec = recKey(), salt2 = rnd(16);
-  S.bad = ""; S.msg = "Making a new recovery key&hellip;"; render();
-  kek(cur, unb64(st.salt)).then(function(k){ return unseal(k, st.wrapP); }).then(function(raw){ return kek(recNorm(rec), salt2).then(function(k2){ return seal(k2, raw); }); })
-    .then(function(wrapR){ var st2 = load(); st2.salt2 = b64(salt2); st2.wrapR = wrapR; save(st2); log("New recovery key made (the old one no longer works)"); S.msg = ""; S.showRec = rec; render(); })
-    .catch(function(){ S.msg = ""; S.bad = "The current passcode is not right."; render(); });
-}
 function download(name, text, type){
   var a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], {type:type})); a.download = name; document.body.appendChild(a); a.click();
   setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
 }
-function backup(){ S.chain.then(function(){ var st = load(); if(!st) return; delete st.otp; download("Client-Payments-Backup-" + today() + ".json", JSON.stringify({cwpay:1, store:st}), "application/json"); log("Encrypted backup downloaded"); }); }
+function backup(){ S.chain.then(function(){ var st = load(); if(!st) return; delete st.otp; delete st.wrapD; delete st.wrapR; delete st.salt2; download("Client-Payments-Backup-" + today() + ".json", JSON.stringify({cwpay:1, store:st}), "application/json"); log("Encrypted backup downloaded"); }); }
 function restore(file){
   var r = new FileReader();
   r.onload = function(){
@@ -33329,12 +33362,6 @@ function msgs(){ return (S.bad ? '<div class="cwp-bad">' + S.bad + '</div>' : ''
 
 function renderLocked(){
   var st = load(), h = '';
-  if(S.showRec){
-    return h + '<fieldset class="cwp-lockcard"><legend>Your recovery key — save it now</legend>' +
-      '<p>This is the ONLY way to get back into Client Payments if you forget your passcode. It is shown only this one time.</p><div class="cwp-rec" id="cwpRecShow">' + E(S.showRec) + '</div>' +
-      '<p class="field-note">Write it down or print it, and keep it somewhere safe (not on this computer). Anyone with this key and access to your email could reset your passcode.</p>' +
-      '<div class="esg-btns"><button type="button" data-cwp="recprint">Print it</button><button type="button" data-cwp="reccopy">Copy it</button><button type="button" class="primary" data-cwp="recdone">I saved it</button></div></fieldset>';
-  }
   if(!st){
     var ok = emailReady();
     return h + msgs() + '<fieldset class="cwp-lockcard"><legend>Set up Client Payments</legend>' +
@@ -33346,12 +33373,17 @@ function renderLocked(){
       '<button type="button" class="primary" data-cwp="setup"' + (ok ? '' : ' disabled') + '>Set up</button></fieldset>';
   }
   if(S.mode === "forgot"){
+    var ro = st.otp && st.otp.purpose === "reset" && Date.now() < st.otp.exp;
     return h + msgs() + '<fieldset class="cwp-lockcard"><legend>Forgot passcode</legend>' +
-      '<div class="field"><label for="cwpRec">Recovery key</label><input type="text" id="cwpRec" placeholder="XXXXX-XXXXX-XXXXX-XXXXX" autocomplete="off" spellcheck="false"></div>' +
-      '<div class="field"><label for="cwpF1">New passcode</label><input type="password" id="cwpF1" autocomplete="new-password"></div>' +
-      '<div class="field"><label for="cwpF2">Type the new passcode again</label><input type="password" id="cwpF2" autocomplete="new-password"></div>' +
-      '<div class="esg-btns"><button type="button" class="primary" data-cwp="forgot">Set new passcode</button><button type="button" class="ghost" data-cwp="back">Back</button></div>' +
-      '<details style="margin-top:14px;"><summary>Lost the recovery key too?</summary><p class="field-note">Without the passcode or the recovery key, the payment records cannot be opened by anyone. You can erase them and start over. Type <b>ERASE</b> to confirm.</p>' +
+      '<p class="field-note">A one-time code will be emailed to <b>' + E(maskEmail(sendTo())) + '</b>. Type it here with a new passcode. The code works once and expires in 10 minutes.</p>' +
+      '<button type="button" class="' + (ro ? 'ghost' : 'primary') + '" data-cwp="resetcode">' + (ro ? 'Send a new code' : 'Email me a code') + '</button>' +
+      (ro ? '<div class="field" style="margin-top:10px;"><label for="cwpRCode">One-time code from your email</label><input type="text" id="cwpRCode" class="cwp-otp" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="000000"></div>' +
+        '<div class="field-note" style="margin-bottom:8px;">Expires in <b id="cwpCountdown">' + fmtLeft(st.otp.exp - Date.now()) + '</b> &bull; works only once</div>' +
+        '<div class="field"><label for="cwpF1">New passcode (at least 6 characters)</label><input type="password" id="cwpF1" autocomplete="new-password"></div>' +
+        '<div class="field"><label for="cwpF2">Type the new passcode again</label><input type="password" id="cwpF2" autocomplete="new-password"></div>' +
+        '<button type="button" class="primary" data-cwp="forgot">Set new passcode</button>' : '') +
+      '<div class="esg-btns" style="margin-top:8px;"><button type="button" class="ghost" data-cwp="back">Back</button></div>' +
+      '<details style="margin-top:14px;"><summary>Erase everything and start over</summary><p class="field-note">This permanently erases every Client Payments record on this browser. Type <b>ERASE</b> to confirm.</p>' +
       '<div class="field"><input type="text" id="cwpErase" autocomplete="off" placeholder="ERASE"></div><button type="button" data-cwp="erase">Erase all Client Payments records</button></details></fieldset>';
   }
   if(S.step === "otp"){
@@ -33466,9 +33498,7 @@ function renderSettings(){
     '<div class="field"><label for="cwpC1">New passcode</label><input type="password" id="cwpC1" autocomplete="new-password"></div>' +
     '<div class="field"><label for="cwpC2">New passcode again</label><input type="password" id="cwpC2" autocomplete="new-password"></div></div>' +
     '<button type="button" data-cwp="changepass">Change passcode</button></fieldset>' +
-    '<fieldset><legend>Recovery key</legend><p class="field-note">Make a new recovery key if the old one was lost or seen by someone. The old key stops working.</p>' +
-    '<div class="field"><label for="cwpCurR">Current passcode</label><input type="password" id="cwpCurR" autocomplete="current-password"></div><button type="button" data-cwp="newrec">Make a new recovery key</button></fieldset>' +
-    '<fieldset><legend>Backup</legend><p class="field-note">The backup file stays encrypted. It opens only with the passcode (or recovery key) in use when it was made.</p>' +
+    '<fieldset><legend>Backup</legend><p class="field-note">The backup file stays encrypted. It opens only with the passcode in use when it was made.</p>' +
     '<div class="esg-btns"><button type="button" data-cwp="backup">Download encrypted backup</button><label class="btn-like" style="cursor:pointer;">Restore a backup<input type="file" id="cwpRestore" accept=".json,application/json" style="display:none;"></label></div></fieldset>' +
     '<fieldset><legend>Activity log</legend>' + (p.log.length ? '<div style="max-height:220px;overflow:auto;"><table class="cal-table"><tbody>' + p.log.map(function(l){ return '<tr><td style="white-space:nowrap;">' + E(new Date(l.t).toLocaleString()) + '</td><td>' + E(l.ev) + '</td></tr>'; }).join("") + '</tbody></table></div>' : '<p class="field-note">Nothing yet.</p>') +
     '<button type="button" class="ghost" data-cwp="clearlog" style="margin-top:6px;">Clear Log</button></fieldset>';
@@ -33485,7 +33515,7 @@ function render(){
     (S.unlocked ? renderOpen() : renderLocked());
   var f = focus && $(focus);
   if(f && f.tagName === "INPUT" && f.type !== "date"){ f.focus(); try{ f.setSelectionRange(f.value.length, f.value.length); }catch(e){} }
-  else if(!S.unlocked){ var first = $("cwpOtp") || $("cwpPass") || $("cwpRec") || $("cwpNew1"); if(first) try{ first.focus(); }catch(e){} }
+  else if(!S.unlocked){ var first = $("cwpOtp") || $("cwpRCode") || $("cwpPass") || $("cwpNew1"); if(first) try{ first.focus(); }catch(e){} }
 }
 
 /* ---------- events ---------- */
@@ -33504,16 +33534,14 @@ function onClick(e){
     case "setup": return doSetup();
     case "pass": return doPass();
     case "access": return doAccess();
-    case "resend": if(!S.pend){ S.step = "pass"; return render(); } return sendCode(true);
+    case "resend": if(!S.pend){ S.step = "pass"; return render(); } return sendCode(true, "open");
+    case "resetcode": return sendCode(true, "reset");
     case "restart": S.pend = null; S.step = "pass"; return render();
     case "forgotmode": S.mode = "forgot"; return render();
     case "back": S.mode = ""; return render();
     case "forgot": return doForgot();
     case "erase": return doErase();
     case "gosettings": return switchView("settings");
-    case "recprint": return printWin("Client Payments Recovery Key", '<h1>CLIENT PAYMENTS — RECOVERY KEY</h1><div class="org">Keep this paper in a safe place.</div><p style="font:700 26px Courier New,monospace;text-align:center;margin:30px 0;">' + E(S.showRec) + '</p><p>Use it in Client Payments &gt; Forgot passcode. Made ' + E(new Date().toLocaleString()) + '.</p>', false);
-    case "reccopy": return copy(S.showRec, "Recovery key");
-    case "recdone": S.showRec = ""; if(!S.unlocked){ S.step = "pass"; S.msg = "Set up is done. Type your passcode to open Client Payments."; } return render();
     case "lock": log("Locked"); return lockNow("Locked.");
     case "tab": S.tab = arg; S.form = null; return render();
     case "new": S.form = formFrom(null); return render();
@@ -33531,7 +33559,6 @@ function onClick(e){
     case "marksent": return markSent();
     case "savesettings": return saveSettings();
     case "changepass": return changePass();
-    case "newrec": return newRecovery();
     case "backup": return backup();
     case "clearlog": var pp = pub(); pp.log = []; savePub(pp); return render();
   }
@@ -33552,12 +33579,12 @@ function onInput(e){
   if(el.id === "cwpSendPick" && e.type === "change"){ S.sendId = el.value || null; S.msg = ""; S.bad = ""; return render(); }
   if(el.id === "cwpRestore" && e.type === "change" && el.files && el.files[0]) return restore(el.files[0]);
   if(el.id === "cwpLast4" || el.id === "cwpMyLast4"){ var d = el.value.replace(/\D/g, "").slice(0, 4); if(d !== el.value) el.value = d; }
-  if(el.id === "cwpOtp"){ var o = el.value.replace(/\D/g, "").slice(0, 6); if(o !== el.value) el.value = o; }
+  if(el.id === "cwpOtp" || el.id === "cwpRCode"){ var o = el.value.replace(/\D/g, "").slice(0, 6); if(o !== el.value) el.value = o; }
   if(el.hasAttribute("data-f") && S.form) S.form[el.getAttribute("data-f")] = el.value;
 }
 function onKey(e){
   if(e.key !== "Enter") return; var el = e.target, v = $("viewClientPayments"); if(!v || !v.contains(el) || el.tagName !== "INPUT") return;
-  var map = {cwpPass:"pass", cwpOtp:"access", cwpNew2:"setup", cwpTo:"setup", cwpF2:"forgot", cwpConf:"marksent"};
+  var map = {cwpPass:"pass", cwpOtp:"access", cwpNew2:"setup", cwpTo:"setup", cwpF2:"forgot", cwpRCode:"forgot", cwpConf:"marksent"};
   if(map[el.id]){ e.preventDefault(); var b = v.querySelector('[data-cwp="' + map[el.id] + '"]'); if(b) b.click(); }
 }
 function tick(){
