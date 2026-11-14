@@ -33037,7 +33037,7 @@ function mail(subject, message){
   if(typeof remSend === "function") return remSend({to:to, name:"", subject:subject, message:message});
   var e = ailCfg().ej;
   return fetch("https://api.emailjs.com/api/v1.0/email/send", {method:"POST", headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({service_id:e.service, template_id:e.template, user_id:e.key, template_params:{to_email:to, email:to, to:to, subject:subject, message:message, app_name:"CaseWork", from_name:"CaseWork", message_html:"", html_display:"none", text_display:"block", lock_display:"none", unlock_display:"none", action_display:"none"}})})
+    body:JSON.stringify({service_id:e.service, template_id:e.template, user_id:e.key, template_params:{to_email:to, email:to, to:to, subject:subject, message:message, app_name:"Master Management System", from_name:"Master Management System", message_html:"", html_display:"none", text_display:"block", lock_display:"none", unlock_display:"none", action_display:"none"}})})
     .then(function(r){ return {ok:r.ok, err:r.ok ? "" : "HTTP " + r.status}; }).catch(function(x){ return {ok:false, err:x.message}; });
 }
 function notice(subject, text){ return mail("[Client Payments] " + subject, text + "\n\nTime: " + new Date().toString()); }
