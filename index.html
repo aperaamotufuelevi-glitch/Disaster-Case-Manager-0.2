@@ -32945,6 +32945,653 @@ function fpgqInit(){
 try{ fpgqInit(); }catch(e){ console.error("FPG quick fill", e); }
 /* (added module -- END FPG QUICK FILL) */
 
+/* ======================================================================================
+ (added module -- BEGIN CLIENT PAYMENTS)
+ Its own main-menu tab "Client Payments":
+  - Track payments only: a payment log tied to a Case ID / Application No. (amount, purpose,
+    funding source, method, client's bank + LAST 4 digits only, status, bank confirmation No.,
+    client acknowledgment), printable receipt and payment log, CSV export.
+  - Semi-automatic: "Send a Payment" — copy amount / Zelle phone / Zelle email / memo, open your
+    own bank's website or app, then enter the bank confirmation number and mark it Sent.
+    The money itself is always sent by you inside your own bank's app or website.
+  - Locked: passcode, then a one-time 6-digit code emailed through the EmailJS that is already
+    set up in Settings. The code works once and expires in 10 minutes. Auto-locks when idle.
+  - Everything in this tab is stored ENCRYPTED in this browser (AES-256, key from your passcode).
+    A recovery key (shown once at setup) can reset a forgotten passcode.
+ Nothing existing is edited: this block only reads existing helpers (switchView, ailCfg,
+ remSend, cflTargets/allSavedCases, currentOrgProfile, calUpdateCase) and adds a menu button.
+ ======================================================================================
+ */
+(function(){
+"use strict";
+if(!window.crypto || !document.getElementById) return;
+var KEY = "cwpay_v1", PUB = "cwpay_pub_v1", ITER = 310000, OTP_MIN = 10, OTP_TRIES = 5, PASS_TRIES = 5, COOL_MS = 5 * 60000, RESEND_MS = 60000;
+var STATUSES = ["PENDING — NOT SENT", "SENT", "RECEIVED — CONFIRMED", "CANCELLED", "RETURNED"];
+var DEFAULTS = {
+  purposes:["RENT / MORTGAGE","UTILITIES","FOOD / GROCERIES","BUILDING MATERIALS","HOME REPAIR","TRANSPORTATION","MEDICAL / PRESCRIPTIONS","FUNERAL","CLOTHING","FURNITURE / APPLIANCES","EMERGENCY LODGING","OTHER"],
+  sources:["PERSONAL FUNDS","AGENCY / PROGRAM FUNDS","DONATION","OTHER"],
+  methods:["ZELLE","BANK TRANSFER (ACH)","WIRE TRANSFER","CHECK","CASH","MONEY ORDER","PAYPAL","VENMO","CASH APP","OTHER"],
+  banks:[],
+  myBank:{name:"", nick:"", last4:"", url:""},
+  autoLock:10, caseNote:"no"
+};
+var S = {unlocked:false, dk:null, pend:null, data:null, step:"pass", mode:"", tab:"list", form:null, sendId:null,
+         msg:"", bad:"", showRec:"", lastAct:0, q:"", f:"", sugg:[], chain:Promise.resolve()};
+
+/* ---------- small helpers (own copies, so nothing existing is touched) ---------- */
+function $(id){ return document.getElementById(id); }
+function E(s){ return (s == null ? "" : String(s)).replace(/[&<>"']/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
+function money(n){ n = Number(n) || 0; return "$" + n.toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2}); }
+function today(){ var d = new Date(); return d.getFullYear() + "-" + ("0" + (d.getMonth() + 1)).slice(-2) + "-" + ("0" + d.getDate()).slice(-2); }
+function mdy(iso){ if(!iso) return ""; var p = String(iso).slice(0, 10).split("-"); return p.length === 3 ? p[1] + "/" + p[2] + "/" + p[0] : iso; }
+function phoneFmt(v){ var g = String(v || "").replace(/\D/g, ""); if(g.length === 11 && g[0] === "1") g = g.slice(1); return g.length === 10 ? "(" + g.slice(0,3) + ")" + g.slice(3,6) + "-" + g.slice(6) : String(v || ""); }
+function validEmail(s){ return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(s || "").trim()); }
+function maskEmail(s){ s = String(s || ""); var i = s.indexOf("@"); return i > 1 ? s[0] + "•••" + s.slice(i - 1) : s; }
+function up(s){ return String(s == null ? "" : s).toUpperCase(); }
+function emailReady(){ try{ var e = ailCfg().ej; return !!(e && e.service && e.template && e.key); }catch(x){ return false; } }
+function ownerEmail(){ try{ return ailCfg().owner || ""; }catch(x){ return ""; } }
+function orgName(){ try{ var o = currentOrgProfile(); return (o && o.name) || ""; }catch(x){ return ""; } }
+
+/* ---------- storage ---------- */
+function load(){ try{ return JSON.parse(localStorage.getItem(KEY) || "null"); }catch(e){ return null; } }
+function save(o){ localStorage.setItem(KEY, JSON.stringify(o)); }
+function pub(){ var p = {}; try{ p = JSON.parse(localStorage.getItem(PUB) || "{}") || {}; }catch(e){} p.log = p.log || []; p.fails = p.fails || 0; p.coolUntil = p.coolUntil || 0; return p; }
+function savePub(p){ localStorage.setItem(PUB, JSON.stringify(p)); }
+function log(ev){ var p = pub(); p.log.unshift({t:new Date().toISOString(), ev:ev}); p.log = p.log.slice(0, 80); savePub(p); }
+function sendTo(){ var p = pub(); return p.to || ownerEmail(); }
+
+/* ---------- crypto ---------- */
+var te = new TextEncoder(), td = new TextDecoder();
+function b64(u){ u = new Uint8Array(u); var s = ""; for(var i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s); }
+function unb64(s){ var b = atob(s), u = new Uint8Array(b.length); for(var i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
+function rnd(n){ return crypto.getRandomValues(new Uint8Array(n)); }
+function kek(secret, salt){
+  return crypto.subtle.importKey("raw", te.encode(secret), "PBKDF2", false, ["deriveKey"]).then(function(k){
+    return crypto.subtle.deriveKey({name:"PBKDF2", salt:salt, iterations:ITER, hash:"SHA-256"}, k, {name:"AES-GCM", length:256}, false, ["encrypt", "decrypt"]);
+  });
+}
+function seal(key, bytes){ var iv = rnd(12); return crypto.subtle.encrypt({name:"AES-GCM", iv:iv}, key, bytes).then(function(ct){ return {iv:b64(iv), ct:b64(ct)}; }); }
+function unseal(key, blob){ return crypto.subtle.decrypt({name:"AES-GCM", iv:unb64(blob.iv)}, key, unb64(blob.ct)).then(function(p){ return new Uint8Array(p); }); }
+function dkImport(raw){ return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]); }
+function codeHash(code, salt){
+  return crypto.subtle.importKey("raw", te.encode(code), "PBKDF2", false, ["deriveBits"]).then(function(k){
+    return crypto.subtle.deriveBits({name:"PBKDF2", salt:unb64(salt), iterations:100000, hash:"SHA-256"}, k, 256);
+  }).then(b64);
+}
+function sixDigits(){ var a = new Uint32Array(1); crypto.getRandomValues(a); return ("000000" + (a[0] % 1000000)).slice(-6); }
+var RA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function recKey(){ var r = rnd(20), s = ""; for(var i = 0; i < 20; i++){ s += RA[r[i] % RA.length]; if(i % 5 === 4 && i < 19) s += "-"; } return s; }
+function recNorm(s){ return String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, ""); }
+function weakPass(p){
+  if(String(p).length < 6) return "Use at least 6 characters.";
+  if(/^(.)\1+$/.test(p)) return "That passcode is too easy to guess (all the same character).";
+  if(["123456","654321","1234567","12345678","123456789","password","qwerty","111111","000000","121212","123123"].indexOf(String(p).toLowerCase()) >= 0) return "That passcode is too common. Pick something less obvious.";
+  return "";
+}
+
+/* ---------- email ---------- */
+function mail(subject, message){
+  var to = sendTo();
+  if(!validEmail(to)) return Promise.resolve({ok:false, err:"No email address is set for codes."});
+  if(!emailReady()) return Promise.resolve({ok:false, err:"EmailJS is not set up in Settings."});
+  if(typeof remSend === "function") return remSend({to:to, name:"", subject:subject, message:message});
+  var e = ailCfg().ej;
+  return fetch("https://api.emailjs.com/api/v1.0/email/send", {method:"POST", headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({service_id:e.service, template_id:e.template, user_id:e.key, template_params:{to_email:to, email:to, to:to, subject:subject, message:message, app_name:"CaseWork", from_name:"CaseWork", message_html:"", html_display:"none", text_display:"block", lock_display:"none", unlock_display:"none", action_display:"none"}})})
+    .then(function(r){ return {ok:r.ok, err:r.ok ? "" : "HTTP " + r.status}; }).catch(function(x){ return {ok:false, err:x.message}; });
+}
+function notice(subject, text){ return mail("[Client Payments] " + subject, text + "\n\nTime: " + new Date().toString()); }
+
+/* ---------- data ---------- */
+function settings(){ var s = (S.data && S.data.settings) || {}; var o = JSON.parse(JSON.stringify(DEFAULTS)); Object.keys(s).forEach(function(k){ o[k] = s[k]; }); o.myBank = Object.assign({}, DEFAULTS.myBank, s.myBank || {}); return o; }
+function payments(){ return (S.data && S.data.payments) || []; }
+function findPay(id){ return payments().filter(function(p){ return p.id === id; })[0] || null; }
+function persist(){
+  var dk = S.dk, snapshot = JSON.stringify(S.data);
+  S.chain = S.chain.then(function(){
+    if(!dk) return;
+    return seal(dk, te.encode(snapshot)).then(function(blob){ var st = load(); if(!st) return; st.data = blob; st.saved = new Date().toISOString(); save(st); });
+  }).catch(function(e){ console.error("Client Payments save", e); S.bad = "The change could not be saved on this browser."; render(); });
+  return S.chain;
+}
+function newId(){ var d = today().replace(/-/g, ""), r = rnd(4), s = ""; for(var i = 0; i < 4; i++) s += RA[r[i] % RA.length]; return "PAY-" + d + "-" + s; }
+function targets(){
+  var out = [];
+  try{ if(typeof cflTargets === "function") return cflTargets().map(function(t){ return {key:(t.kind === "dcm" ? "dcm|" + t.caseId : "apx|" + t.pid + "|" + t.key), kind:t.kind, caseId:t.caseId || "", ref:t.id, name:t.name || "", phone:t.phone || "", email:t.email || "", program:t.program || ""}; }); }catch(e){}
+  try{ allSavedCases().forEach(function(c){ if(c && c.caseId) out.push({key:"dcm|" + c.caseId, kind:"dcm", caseId:c.caseId, ref:c.caseId, name:(c.primary || {}).fullName || "", phone:(c.primary || {}).phoneCell || "", email:(c.primary || {}).email || "", program:"Disaster Case Manager"}); }); }catch(e){}
+  return out;
+}
+function stCls(s){ s = String(s || ""); return /^PENDING/.test(s) ? "p" : s === "SENT" ? "s" : /^RECEIVED/.test(s) ? "r" : "x"; }
+
+/* ---------- lock / unlock ---------- */
+function lockNow(why){
+  S.unlocked = false; S.dk = null; S.pend = null; S.data = null; S.form = null; S.sendId = null; S.step = "pass"; S.mode = ""; S.tab = "list";
+  S.msg = why || ""; S.bad = "";
+  render();
+}
+function doSetup(){
+  var p1 = ($("cwpNew1") || {}).value || "", p2 = ($("cwpNew2") || {}).value || "", to = (($("cwpTo") || {}).value || "").trim();
+  var w = weakPass(p1); if(w){ S.bad = w; return render(); }
+  if(p1 !== p2){ S.bad = "The two passcodes do not match."; return render(); }
+  if(!validEmail(to)){ S.bad = "Type the email address where your one-time codes should go."; return render(); }
+  if(!emailReady()){ S.bad = "EmailJS is not set up yet. Fill in the EmailJS details in Settings first."; return render(); }
+  S.bad = ""; S.msg = "Setting up&hellip;"; render();
+  var raw = rnd(32), salt = rnd(16), salt2 = rnd(16), rec = recKey();
+  var data = {v:1, payments:[], settings:JSON.parse(JSON.stringify(DEFAULTS))};
+  Promise.all([kek(p1, salt), kek(recNorm(rec), salt2), dkImport(raw)]).then(function(k){
+    return Promise.all([seal(k[0], raw), seal(k[1], raw), seal(k[2], te.encode(JSON.stringify(data)))]);
+  }).then(function(w){
+    save({v:1, iter:ITER, salt:b64(salt), salt2:b64(salt2), wrapP:w[0], wrapR:w[1], data:w[2], created:new Date().toISOString()});
+    var p = pub(); p.to = to; p.fails = 0; p.coolUntil = 0; savePub(p); log("Client Payments was set up");
+    S.showRec = rec; S.msg = ""; render();
+  }).catch(function(e){ console.error(e); S.msg = ""; S.bad = "This browser could not set up the lock. Open the system in an up-to-date Chrome."; render(); });
+}
+function doPass(){
+  var pass = ($("cwpPass") || {}).value || "", st = load(), p = pub();
+  if(!st) return render();
+  if(Date.now() < p.coolUntil){ S.bad = "Too many wrong passcodes. Try again in " + Math.ceil((p.coolUntil - Date.now()) / 60000) + " minute(s)."; return render(); }
+  if(!pass){ S.bad = "Type your passcode."; return render(); }
+  S.bad = ""; S.msg = "Checking&hellip;"; render();
+  kek(pass, unb64(st.salt)).then(function(k){ return unseal(k, st.wrapP); }).then(dkImport).then(function(dk){
+    var p2 = pub(); p2.fails = 0; savePub(p2);
+    S.pend = dk; S.msg = ""; sendCode(false);
+  }).catch(function(){
+    var p2 = pub(); p2.fails++; var left = PASS_TRIES - p2.fails;
+    if(p2.fails >= PASS_TRIES){ p2.fails = 0; p2.coolUntil = Date.now() + COOL_MS; savePub(p2); log("5 wrong passcodes — locked for 5 minutes");
+      notice("5 wrong passcodes", "Someone typed the wrong Client Payments passcode 5 times. Client Payments is blocked for 5 minutes.\n\nIf this was not you, change your passcode.");
+      S.bad = "Wrong passcode 5 times. Client Payments is blocked for 5 minutes."; }
+    else { savePub(p2); S.bad = "Wrong passcode. " + left + " tr" + (left === 1 ? "y" : "ies") + " left."; }
+    S.msg = ""; render();
+  });
+}
+function sendCode(force){
+  var st = load(), o = st && st.otp;
+  if(!force && o && Date.now() < o.exp){ S.step = "otp"; S.msg = "A code was already sent to " + E(maskEmail(sendTo())) + ". Use that code, or press <b>Send a new code</b>."; return render(); }
+  if(force && o && Date.now() - o.sent < RESEND_MS){ S.step = "otp"; S.bad = "Please wait a minute before sending another code."; return render(); }
+  var code = sixDigits(), salt = b64(rnd(16));
+  S.step = "otp"; S.bad = ""; S.msg = "Sending your one-time code&hellip;"; render();
+  codeHash(code, salt).then(function(h){
+    var body = "Your one-time access code for Client Payments is: " + code + "\n\n" +
+      "It works only once and expires in " + OTP_MIN + " minutes.\n\n" +
+      "If you did not try to open Client Payments, someone may know your passcode. Change it in Client Payments > Settings.";
+    return mail("[Client Payments] Your one-time access code", body).then(function(res){
+      var st2 = load(); if(!st2) return;
+      if(res && res.ok){
+        st2.otp = {hash:h, salt:salt, exp:Date.now() + OTP_MIN * 60000, sent:Date.now(), tries:0}; save(st2);
+        log("One-time code sent to " + maskEmail(sendTo()));
+        S.msg = "A one-time code was sent to <b>" + E(maskEmail(sendTo())) + "</b>. Type it below and press <b>Access</b>.";
+      } else {
+        S.msg = ""; S.bad = "The code email did not send" + (res && res.err ? " (" + E(String(res.err).slice(0, 120)) + ")" : "") + ". Check the EmailJS details in Settings, then press Send a new code.";
+      }
+      render();
+    });
+  }).catch(function(){ S.msg = ""; S.bad = "The code could not be made on this browser."; render(); });
+}
+function doAccess(){
+  var code = (($("cwpOtp") || {}).value || "").replace(/\D/g, ""), st = load();
+  if(!S.pend){ S.step = "pass"; S.bad = "Type your passcode first."; return render(); }
+  var o = st && st.otp;
+  if(!o){ S.bad = "No code is waiting. Press Send a new code."; return render(); }
+  if(Date.now() > o.exp){ delete st.otp; save(st); log("One-time code expired"); S.msg = ""; S.bad = "That code expired (10 minutes). Press Send a new code."; return render(); }
+  if(code.length !== 6){ S.bad = "Type the 6-digit code from the email."; return render(); }
+  codeHash(code, o.salt).then(function(h){
+    var st2 = load(), o2 = st2 && st2.otp; if(!o2){ S.bad = "No code is waiting. Press Send a new code."; return render(); }
+    if(h !== o2.hash){
+      o2.tries = (o2.tries || 0) + 1;
+      if(o2.tries >= OTP_TRIES){ delete st2.otp; save(st2); log("Code cancelled after 5 wrong tries"); S.msg = ""; S.bad = "Wrong code 5 times. That code is cancelled. Press Send a new code."; }
+      else { save(st2); S.bad = "Wrong code. " + (OTP_TRIES - o2.tries) + " tries left."; }
+      return render();
+    }
+    delete st2.otp; save(st2);              // used once — gone
+    return unseal(S.pend, st2.data).then(function(bytes){
+      S.data = JSON.parse(td.decode(bytes)); S.data.payments = S.data.payments || []; S.data.settings = S.data.settings || {};
+      S.dk = S.pend; S.pend = null; S.unlocked = true; S.lastAct = Date.now(); S.tab = "list"; S.msg = ""; S.bad = "";
+      log("Opened Client Payments"); render();
+    });
+  }).catch(function(e){ console.error(e); S.bad = "Client Payments could not be opened on this browser."; render(); });
+}
+function doForgot(){
+  var rec = recNorm(($("cwpRec") || {}).value), p1 = ($("cwpF1") || {}).value || "", p2 = ($("cwpF2") || {}).value || "", st = load();
+  if(rec.length !== 20){ S.bad = "Type the full 20-character recovery key."; return render(); }
+  var w = weakPass(p1); if(w){ S.bad = w; return render(); }
+  if(p1 !== p2){ S.bad = "The two new passcodes do not match."; return render(); }
+  S.bad = ""; S.msg = "Checking&hellip;"; render();
+  var salt = rnd(16);
+  kek(rec, unb64(st.salt2)).then(function(k){ return unseal(k, st.wrapR); }).then(function(raw){
+    return kek(p1, salt).then(function(k2){ return seal(k2, raw); });
+  }).then(function(wrapP){
+    var st2 = load(); st2.salt = b64(salt); st2.wrapP = wrapP; delete st2.otp; save(st2);
+    log("Passcode reset with the recovery key"); notice("Passcode was reset", "The Client Payments passcode was reset with the recovery key.\n\nIf this was not you, make a new recovery key and change the passcode right away.");
+    S.mode = ""; S.step = "pass"; S.msg = "Your new passcode is set. Type it below to continue."; render();
+  }).catch(function(){ S.msg = ""; S.bad = "That recovery key is not right."; render(); });
+}
+function doErase(){
+  var t = (($("cwpErase") || {}).value || "").trim().toUpperCase();
+  if(t !== "ERASE"){ S.bad = "Type ERASE in the box to confirm."; return render(); }
+  localStorage.removeItem(KEY); log("All Client Payments records were erased (passcode and recovery key were lost)");
+  notice("All records erased", "All Client Payments records on this browser were erased because the passcode and recovery key were lost.");
+  S.mode = ""; S.step = "pass"; S.msg = "Erased. You can set up Client Payments again."; S.bad = ""; render();
+}
+
+/* ---------- unlocked actions ---------- */
+function formFrom(p){
+  var s = settings();
+  return p ? JSON.parse(JSON.stringify(p)) : {id:"", caseKey:"", caseRef:"", caseKind:"", caseId:"", program:"", client:"", clientPhone:"", payee:"", date:today(), amount:"", purpose:"", source:s.sources[0] || "",
+    method:s.methods[0] || "", bank:"", acctType:"CHECKING", last4:"", zPhone:"", zEmail:"", status:STATUSES[0], conf:"", sentDate:"", ack:"NOT YET", ackDate:"", notes:""};
+}
+function readForm(){
+  var f = S.form; if(!f) return;
+  Array.prototype.forEach.call(document.querySelectorAll("#viewClientPayments [data-f]"), function(el){ f[el.getAttribute("data-f")] = el.value; });
+}
+function savePayment(){
+  readForm(); var f = S.form, errs = [];
+  if(!f.caseKey) errs.push("Pick the case or application from the list (type 1+ letters of the name, Case ID or Application No.).");
+  if(!(Number(f.amount) > 0)) errs.push("Type the amount.");
+  if(f.last4 && !/^\d{4}$/.test(f.last4)) errs.push("Account: type only the LAST 4 digits.");
+  if(!f.purpose) errs.push("Pick the purpose.");
+  if(errs.length){ S.bad = errs.join("<br>"); return render(); }
+  f.amount = (Math.round(Number(f.amount) * 100) / 100).toFixed(2);
+  ["client","payee","notes","conf","bank","purpose","source","method"].forEach(function(k){ f[k] = up(f[k]).trim(); });
+  if(!f.payee) f.payee = f.client;
+  var now = new Date().toISOString();
+  if(!f.id){ f.id = newId(); f.created = now; f.history = [{t:now, ev:"Recorded (" + f.status + ")"}]; S.data.payments.unshift(f); }
+  else {
+    var i = payments().findIndex(function(p){ return p.id === f.id; }); if(i < 0) return;
+    var old = S.data.payments[i]; f.history = (old.history || []).slice();
+    if(old.status !== f.status) f.history.push({t:now, ev:"Status: " + old.status + " → " + f.status});
+    else f.history.push({t:now, ev:"Edited"});
+    S.data.payments[i] = f;
+  }
+  f.updated = now; S.form = null; S.bad = ""; S.msg = "Payment " + E(f.id) + " saved.";
+  persist(); render();
+}
+function deletePayment(id){
+  var p = findPay(id); if(!p) return;
+  var go = function(){ S.data.payments = payments().filter(function(x){ return x.id !== id; }); S.form = null; if(S.sendId === id) S.sendId = null; S.msg = "Payment " + E(id) + " deleted."; persist(); log("Deleted payment " + id); render(); };
+  if(typeof stpPopup === "function") stpPopup({kind:"red", title:"Delete payment " + E(id) + "?", html:"<p>" + E(p.payee || p.client) + " — " + money(p.amount) + "</p><p>This cannot be undone.</p>", buttons:[{label:"Delete", cls:"primary", fn:go}, {label:"Cancel"}]});
+  else if(confirm("Delete payment " + id + "? This cannot be undone.")) go();
+}
+function markSent(){
+  var p = findPay(S.sendId); if(!p) return;
+  var conf = up((($("cwpConf") || {}).value || "").trim()), d = ($("cwpSentDate") || {}).value || today();
+  if(!conf){ S.bad = "Type the confirmation or reference number your bank gave you (it proves the payment was sent)."; return render(); }
+  var now = new Date().toISOString();
+  p.status = "SENT"; p.conf = conf; p.sentDate = d; p.updated = now; p.history = p.history || []; p.history.push({t:now, ev:"Marked Sent — confirmation " + conf});
+  if(settings().caseNote === "yes" && p.caseKind === "dcm" && p.caseId && typeof calUpdateCase === "function"){
+    try{ calUpdateCase(p.caseId, function(obj){ obj.caseManagerComments = obj.caseManagerComments || [];
+      obj.caseManagerComments.push({id:"cwpay_" + Date.now(), date:d, content:"PAYMENT SENT TO CLIENT: " + money(p.amount) + " — " + p.purpose + " — VIA " + p.method + " — CONFIRMATION " + conf + " — REF " + p.id}); }); }catch(e){ console.error(e); }
+  }
+  S.msg = "Payment " + E(p.id) + " marked <b>Sent</b>."; S.bad = ""; S.sendId = null;
+  persist(); log("Marked sent " + p.id); render();
+}
+function saveSettings(){
+  var s = settings(), lines = function(id){ return (($(id) || {}).value || "").split(/\n+/).map(function(x){ return up(x).trim(); }).filter(Boolean); };
+  s.banks = lines("cwpSBanks"); s.purposes = lines("cwpSPurp"); s.sources = lines("cwpSSrc"); s.methods = lines("cwpSMeth");
+  if(!s.purposes.length) s.purposes = DEFAULTS.purposes.slice(); if(!s.sources.length) s.sources = DEFAULTS.sources.slice(); if(!s.methods.length) s.methods = DEFAULTS.methods.slice();
+  var l4 = (($("cwpMyLast4") || {}).value || "").trim();
+  if(l4 && !/^\d{4}$/.test(l4)){ S.bad = "Your account: type only the LAST 4 digits."; return render(); }
+  var url = (($("cwpMyUrl") || {}).value || "").trim(); if(url && !/^https?:\/\//i.test(url)) url = "https://" + url;
+  s.myBank = {name:up(($("cwpMyName") || {}).value).trim(), nick:up(($("cwpMyNick") || {}).value).trim(), last4:l4, url:url};
+  s.autoLock = +(($("cwpSAuto") || {}).value) || 10; s.caseNote = ($("cwpSNote") || {}).value === "yes" ? "yes" : "no";
+  var to = (($("cwpSTo") || {}).value || "").trim();
+  if(!validEmail(to)){ S.bad = "Type a valid email address for your one-time codes."; return render(); }
+  var p = pub(); if(p.to !== to) log("Code email changed to " + maskEmail(to)); p.to = to; savePub(p);
+  S.data.settings = s; S.bad = ""; S.msg = "Settings saved."; persist(); render();
+}
+function changePass(){
+  var cur = ($("cwpCur") || {}).value || "", p1 = ($("cwpC1") || {}).value || "", p2 = ($("cwpC2") || {}).value || "", st = load();
+  var w = weakPass(p1); if(w){ S.bad = w; return render(); }
+  if(p1 !== p2){ S.bad = "The two new passcodes do not match."; return render(); }
+  S.bad = ""; S.msg = "Changing&hellip;"; render();
+  var salt = rnd(16);
+  kek(cur, unb64(st.salt)).then(function(k){ return unseal(k, st.wrapP); }).then(function(raw){ return kek(p1, salt).then(function(k2){ return seal(k2, raw); }); })
+    .then(function(wrapP){ var st2 = load(); st2.salt = b64(salt); st2.wrapP = wrapP; save(st2); log("Passcode changed"); S.msg = "Passcode changed."; render(); })
+    .catch(function(){ S.msg = ""; S.bad = "The current passcode is not right."; render(); });
+}
+function newRecovery(){
+  var cur = ($("cwpCurR") || {}).value || "", st = load(), rec = recKey(), salt2 = rnd(16);
+  S.bad = ""; S.msg = "Making a new recovery key&hellip;"; render();
+  kek(cur, unb64(st.salt)).then(function(k){ return unseal(k, st.wrapP); }).then(function(raw){ return kek(recNorm(rec), salt2).then(function(k2){ return seal(k2, raw); }); })
+    .then(function(wrapR){ var st2 = load(); st2.salt2 = b64(salt2); st2.wrapR = wrapR; save(st2); log("New recovery key made (the old one no longer works)"); S.msg = ""; S.showRec = rec; render(); })
+    .catch(function(){ S.msg = ""; S.bad = "The current passcode is not right."; render(); });
+}
+function download(name, text, type){
+  var a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], {type:type})); a.download = name; document.body.appendChild(a); a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+function backup(){ S.chain.then(function(){ var st = load(); if(!st) return; delete st.otp; download("Client-Payments-Backup-" + today() + ".json", JSON.stringify({cwpay:1, store:st}), "application/json"); log("Encrypted backup downloaded"); }); }
+function restore(file){
+  var r = new FileReader();
+  r.onload = function(){
+    try{
+      var o = JSON.parse(r.result); if(!o || o.cwpay !== 1 || !o.store || !o.store.wrapP) throw new Error("bad");
+      var go = function(){ save(o.store); log("Backup restored"); lockNow("Backup restored. Open Client Payments with the passcode that belongs to that backup."); };
+      if(typeof stpPopup === "function") stpPopup({kind:"amber", title:"Replace Client Payments with this backup?", html:"<p>Every payment now in Client Payments on this browser will be replaced by the backup. The backup opens with <b>its own</b> passcode and recovery key.</p>", buttons:[{label:"Replace", cls:"primary", fn:go}, {label:"Cancel"}]});
+      else if(confirm("Replace Client Payments with this backup?")) go();
+    }catch(e){ S.bad = "That file is not a Client Payments backup."; render(); }
+  };
+  r.readAsText(file);
+}
+function csv(){
+  var head = ["Payment ID","Date","Case / Application","Program","Client","Payee","Amount","Purpose","Funding Source","Method","Client Bank","Account Type","Account Last 4","Status","Confirmation No.","Date Sent","Acknowledgment","Notes"];
+  var q = function(v){ v = String(v == null ? "" : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+  var rows = filtered().map(function(p){ return [p.id, mdy(p.date), p.caseRef, p.program, p.client, p.payee, money(p.amount), p.purpose, p.source, p.method, p.bank, p.acctType, p.last4 ? "****" + p.last4 : "", p.status, p.conf, mdy(p.sentDate), p.ack + (p.ackDate ? " " + mdy(p.ackDate) : ""), p.notes].map(q).join(","); });
+  download("Client-Payments-" + today() + ".csv", [head.map(q).join(",")].concat(rows).join("\r\n"), "text/csv");
+}
+function copy(text, label){
+  var done = function(){ S.msg = E(label) + " copied."; S.bad = ""; render(); };
+  if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback); else fallback();
+  function fallback(){ var t = document.createElement("textarea"); t.value = text; t.style.position = "fixed"; t.style.opacity = "0"; document.body.appendChild(t); t.select(); try{ document.execCommand("copy"); done(); }catch(e){ S.bad = "Could not copy on this browser."; render(); } t.remove(); }
+}
+
+/* ---------- printing ---------- */
+var PRINT_CSS = 'body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:28px;font-size:13px;}h1{font-size:18px;text-align:center;margin:0 0 2px;}.org{text-align:center;font-size:13px;margin-bottom:14px;}' +
+  '.sh{background:#E5E7EB;font-weight:700;padding:5px 8px;margin:14px 0 6px;border:1px solid #C9CDD2;}table{border-collapse:collapse;width:100%;}td,th{border:1px solid #C9CDD2;padding:5px 7px;text-align:left;vertical-align:top;}' +
+  'th{background:#F3F4F6;font-size:12px;}.v{font-family:"Courier New",monospace;font-weight:700;text-transform:uppercase;}.sig{display:flex;gap:30px;margin-top:40px;}.sig div{flex:1;border-top:1px solid #111;padding-top:4px;font-size:12px;}.ft{margin-top:18px;font-size:11px;color:#444;}';
+function printWin(title, body, landscape){
+  var w = window.open("", "_blank"); if(!w){ alert("Allow pop-ups for this page to print."); return; }
+  w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>' + E(title) + '</title><style>' + PRINT_CSS + '@page{size:letter ' + (landscape ? "landscape" : "portrait") + ';margin:0.5in;}</style></head><body>' + body + '<script>setTimeout(function(){window.print();},300);<\/script></body></html>');
+  w.document.close();
+}
+function printReceipt(id){
+  var p = findPay(id); if(!p) return; var s = settings();
+  var row = function(l, v){ return '<tr><th style="width:32%">' + E(l) + '</th><td class="v">' + E(v || "") + '</td></tr>'; };
+  var b = '<h1>PAYMENT RECEIPT AND ACKNOWLEDGMENT</h1><div class="org">' + E(up(orgName())) + '</div>' +
+    '<div class="sh">PAYMENT</div><table>' + row("Payment ID", p.id) + row("Date", mdy(p.date)) + row("Amount", money(p.amount)) + row("Purpose", p.purpose) + row("Funding Source", p.source) + row("Payment Method", p.method) + row("Status", p.status) + row("Bank Confirmation No.", p.conf) + row("Date Sent", mdy(p.sentDate)) + '</table>' +
+    '<div class="sh">RECIPIENT</div><table>' + row("Case / Application No.", p.caseRef) + row("Program", p.program) + row("Client", p.client) + row("Paid To", p.payee) + row("Client Bank", p.bank) + row("Account", (p.acctType || "") + (p.last4 ? " ending in " + p.last4 : "")) + '</table>' +
+    (p.notes ? '<div class="sh">NOTES</div><table><tr><td class="v">' + E(p.notes) + '</td></tr></table>' : '') +
+    '<div class="sh">ACKNOWLEDGMENT</div><p>I acknowledge that I received the payment described above.</p>' +
+    '<div class="sig"><div>Client Signature</div><div>Date</div></div><div class="sig"><div>Case Manager Signature</div><div>Date</div></div>' +
+    '<div class="ft">Paid from: ' + E(s.myBank.name || "") + (s.myBank.last4 ? " (account ending in " + E(s.myBank.last4) + ")" : "") + '</div>';
+  printWin("Payment Receipt " + p.id, b, false);
+}
+function printLog(){
+  var list = filtered(), tot = list.reduce(function(a, p){ return a + (Number(p.amount) || 0); }, 0);
+  var b = '<h1>CLIENT PAYMENT LOG</h1><div class="org">' + E(up(orgName())) + ' &mdash; PRINTED ' + mdy(today()) + (S.f ? ' &mdash; STATUS: ' + E(S.f) : '') + '</div><table><thead><tr><th>Payment ID</th><th>Date</th><th>Case / Appl. No.</th><th>Client</th><th>Amount</th><th>Purpose</th><th>Source</th><th>Method</th><th>Acct</th><th>Status</th><th>Confirmation</th></tr></thead><tbody>' +
+    list.map(function(p){ return '<tr class="v"><td>' + E(p.id) + '</td><td>' + mdy(p.date) + '</td><td>' + E(p.caseRef) + '</td><td>' + E(p.client) + '</td><td>' + money(p.amount) + '</td><td>' + E(p.purpose) + '</td><td>' + E(p.source) + '</td><td>' + E(p.method) + '</td><td>' + (p.last4 ? "****" + E(p.last4) : "") + '</td><td>' + E(p.status) + '</td><td>' + E(p.conf) + '</td></tr>'; }).join("") +
+    '</tbody><tfoot><tr><th colspan="4">TOTAL (' + list.length + ' PAYMENTS)</th><th>' + money(tot) + '</th><th colspan="6"></th></tr></tfoot></table>';
+  printWin("Client Payment Log", b, true);
+}
+
+/* ---------- rendering ---------- */
+function filtered(){
+  var q = S.q.trim().toUpperCase();
+  return payments().filter(function(p){
+    if(S.f && p.status !== S.f) return false;
+    if(!q) return true;
+    return [p.id, p.caseRef, p.client, p.payee, p.conf, p.purpose].join(" ").toUpperCase().indexOf(q) >= 0;
+  });
+}
+function opts(list, cur, blank){ var o = blank ? '<option value="">' + E(blank) + '</option>' : ''; var has = false;
+  list.forEach(function(x){ if(x === cur) has = true; o += '<option' + (x === cur ? ' selected' : '') + '>' + E(x) + '</option>'; });
+  if(cur && !has) o += '<option selected>' + E(cur) + '</option>'; return o; }
+function msgs(){ return (S.bad ? '<div class="cwp-bad">' + S.bad + '</div>' : '') + (S.msg ? '<div class="cwp-msg">' + S.msg + '</div>' : ''); }
+
+function renderLocked(){
+  var st = load(), h = '';
+  if(S.showRec){
+    return h + '<fieldset class="cwp-lockcard"><legend>Your recovery key — save it now</legend>' +
+      '<p>This is the ONLY way to get back into Client Payments if you forget your passcode. It is shown only this one time.</p><div class="cwp-rec" id="cwpRecShow">' + E(S.showRec) + '</div>' +
+      '<p class="field-note">Write it down or print it, and keep it somewhere safe (not on this computer). Anyone with this key and access to your email could reset your passcode.</p>' +
+      '<div class="esg-btns"><button type="button" data-cwp="recprint">Print it</button><button type="button" data-cwp="reccopy">Copy it</button><button type="button" class="primary" data-cwp="recdone">I saved it</button></div></fieldset>';
+  }
+  if(!st){
+    var ok = emailReady();
+    return h + msgs() + '<fieldset class="cwp-lockcard"><legend>Set up Client Payments</legend>' +
+      '<p class="field-note">Make a passcode for this tab. Each time you open it you will type the passcode, and a one-time code will be emailed to you. The code works once and expires in 10 minutes.</p>' +
+      (ok ? '' : '<div class="cwp-warn">EmailJS is not set up yet. Fill in the EmailJS details in Settings first. <button type="button" class="ghost" data-cwp="gosettings">Open Settings</button></div>') +
+      '<div class="field"><label for="cwpNew1">New passcode (at least 6 characters)</label><input type="password" id="cwpNew1" autocomplete="new-password"></div>' +
+      '<div class="field"><label for="cwpNew2">Type the passcode again</label><input type="password" id="cwpNew2" autocomplete="new-password"></div>' +
+      '<div class="field"><label for="cwpTo">Send one-time codes to this email</label><input type="email" id="cwpTo" value="' + E(sendTo()) + '" autocomplete="email"></div>' +
+      '<button type="button" class="primary" data-cwp="setup"' + (ok ? '' : ' disabled') + '>Set up</button></fieldset>';
+  }
+  if(S.mode === "forgot"){
+    return h + msgs() + '<fieldset class="cwp-lockcard"><legend>Forgot passcode</legend>' +
+      '<div class="field"><label for="cwpRec">Recovery key</label><input type="text" id="cwpRec" placeholder="XXXXX-XXXXX-XXXXX-XXXXX" autocomplete="off" spellcheck="false"></div>' +
+      '<div class="field"><label for="cwpF1">New passcode</label><input type="password" id="cwpF1" autocomplete="new-password"></div>' +
+      '<div class="field"><label for="cwpF2">Type the new passcode again</label><input type="password" id="cwpF2" autocomplete="new-password"></div>' +
+      '<div class="esg-btns"><button type="button" class="primary" data-cwp="forgot">Set new passcode</button><button type="button" class="ghost" data-cwp="back">Back</button></div>' +
+      '<details style="margin-top:14px;"><summary>Lost the recovery key too?</summary><p class="field-note">Without the passcode or the recovery key, the payment records cannot be opened by anyone. You can erase them and start over. Type <b>ERASE</b> to confirm.</p>' +
+      '<div class="field"><input type="text" id="cwpErase" autocomplete="off" placeholder="ERASE"></div><button type="button" data-cwp="erase">Erase all Client Payments records</button></details></fieldset>';
+  }
+  if(S.step === "otp"){
+    var o = st.otp, left = o ? Math.max(0, o.exp - Date.now()) : 0;
+    return h + msgs() + '<fieldset class="cwp-lockcard"><legend>&#128274; One-time code</legend>' +
+      '<div class="field"><label for="cwpOtp">One-time code from your email</label><input type="text" id="cwpOtp" class="cwp-otp" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="000000"></div>' +
+      '<div class="field-note" style="margin-bottom:8px;">' + (o ? 'Expires in <b id="cwpCountdown">' + fmtLeft(left) + '</b> &bull; works only once' : 'No code is waiting.') + '</div>' +
+      '<div class="esg-btns"><button type="button" class="primary" data-cwp="access">Access</button><button type="button" class="ghost" data-cwp="resend">Send a new code</button><button type="button" class="ghost" data-cwp="restart">Start over</button></div></fieldset>';
+  }
+  var p = pub();
+  return h + msgs() + '<fieldset class="cwp-lockcard"><legend>&#128274; Client Payments is locked</legend>' +
+    (Date.now() < p.coolUntil ? '<div class="cwp-warn">Too many wrong passcodes. Try again after ' + new Date(p.coolUntil).toLocaleTimeString() + '.</div>' : '') +
+    '<div class="field"><label for="cwpPass">Passcode</label><input type="password" id="cwpPass" autocomplete="current-password"></div>' +
+    '<div class="esg-btns"><button type="button" class="primary" data-cwp="pass">Continue</button><button type="button" class="ghost" data-cwp="forgotmode">Forgot passcode?</button></div>' +
+    '<p class="field-note" style="margin-top:8px;">After your passcode, a one-time code is emailed to <b>' + E(maskEmail(sendTo())) + '</b>.</p></fieldset>';
+}
+function fmtLeft(ms){ var s = Math.ceil(ms / 1000), m = Math.floor(s / 60); s = s % 60; return m + ":" + ("0" + s).slice(-2); }
+
+function renderForm(){
+  var f = S.form, s = settings(), banks = s.banks.slice(); if(banks.indexOf("OTHER") < 0) banks.push("OTHER");
+  return '<fieldset><legend>' + (f.id ? 'Edit payment ' + E(f.id) : 'New payment') + '</legend><div class="row">' +
+    '<div class="field" style="flex:2 1 300px;position:relative;"><label for="cwpCaseSearch">Case or application — type a name, Case ID or Application No.</label><input type="text" id="cwpCaseSearch" autocomplete="off" placeholder="Type 1+ letters..." value="' + E(f.caseRef ? f.caseRef + " — " + f.client : "") + '"><div id="cwpSugg" class="cwp-sugg" style="display:none;"></div></div>' +
+    '<div class="field"><label>Program</label><input type="text" value="' + E(f.program) + '" readonly></div></div><div class="row">' +
+    '<div class="field"><label for="cwpClient">Client name</label><input type="text" id="cwpClient" data-f="client" value="' + E(f.client) + '"></div>' +
+    '<div class="field"><label for="cwpPayee">Paid to (name on the bank account)</label><input type="text" id="cwpPayee" data-f="payee" value="' + E(f.payee) + '"></div></div><div class="row">' +
+    '<div class="field"><label for="cwpDate">Payment date</label><input type="date" id="cwpDate" data-f="date" value="' + E(f.date) + '"></div>' +
+    '<div class="field"><label for="cwpAmount">Amount</label><input type="number" id="cwpAmount" data-f="amount" min="0" step="0.01" inputmode="decimal" value="' + E(f.amount) + '"></div>' +
+    '<div class="field"><label for="cwpPurpose">Purpose</label><select id="cwpPurpose" data-f="purpose">' + opts(s.purposes, f.purpose, "— pick —") + '</select></div>' +
+    '<div class="field"><label for="cwpSource">Funding source</label><select id="cwpSource" data-f="source">' + opts(s.sources, f.source) + '</select></div></div><div class="row">' +
+    '<div class="field"><label for="cwpMethod">Payment method</label><select id="cwpMethod" data-f="method">' + opts(s.methods, f.method) + '</select></div>' +
+    '<div class="field"><label for="cwpBank">Client&rsquo;s bank</label><select id="cwpBank" data-f="bank">' + opts(banks, f.bank, "— pick —") + '</select></div>' +
+    '<div class="field"><label for="cwpAcctType">Account type</label><select id="cwpAcctType" data-f="acctType">' + opts(["CHECKING", "SAVINGS"], f.acctType, "—") + '</select></div>' +
+    '<div class="field"><label for="cwpLast4">Account — last 4 digits only</label><input type="text" id="cwpLast4" data-f="last4" maxlength="4" inputmode="numeric" pattern="\\d{4}" placeholder="1234" value="' + E(f.last4) + '"></div></div>' +
+    '<div class="field-note" style="margin:-4px 0 8px;">Never type the full account number here. The full number stays in your bank app only.</div><div class="row">' +
+    '<div class="field"><label for="cwpZPhone">Zelle phone (if paying by Zelle)</label><input type="tel" id="cwpZPhone" data-f="zPhone" value="' + E(f.zPhone) + '"></div>' +
+    '<div class="field"><label for="cwpZEmail">Zelle email (if paying by Zelle)</label><input type="email" id="cwpZEmail" data-f="zEmail" value="' + E(f.zEmail) + '"></div></div><div class="row">' +
+    '<div class="field"><label for="cwpStatus">Status</label><select id="cwpStatus" data-f="status">' + opts(STATUSES, f.status) + '</select></div>' +
+    '<div class="field"><label for="cwpConfF">Bank confirmation No.</label><input type="text" id="cwpConfF" data-f="conf" value="' + E(f.conf) + '"></div>' +
+    '<div class="field"><label for="cwpSentF">Date sent</label><input type="date" id="cwpSentF" data-f="sentDate" value="' + E(f.sentDate) + '"></div></div><div class="row">' +
+    '<div class="field"><label for="cwpAck">Client signed the receipt</label><select id="cwpAck" data-f="ack">' + opts(["NOT YET", "YES"], f.ack) + '</select></div>' +
+    '<div class="field"><label for="cwpAckDate">Date signed</label><input type="date" id="cwpAckDate" data-f="ackDate" value="' + E(f.ackDate) + '"></div></div>' +
+    '<div class="field"><label for="cwpNotes">Notes</label><textarea id="cwpNotes" data-f="notes" rows="3">' + E(f.notes) + '</textarea></div>' +
+    '<div class="esg-btns"><button type="button" class="primary" data-cwp="savepay">Save Payment</button><button type="button" class="ghost" data-cwp="cancelform">Cancel</button>' +
+    (f.id ? '<button type="button" class="ghost" data-cwp="del" data-arg="' + E(f.id) + '">Delete</button>' : '') + '</div></fieldset>';
+}
+function renderList(){
+  var all = payments(), month = today().slice(0, 7), pend = all.filter(function(p){ return /^PENDING/.test(p.status); });
+  var sent = all.filter(function(p){ return p.status === "SENT" || /^RECEIVED/.test(p.status); });
+  var sum = function(l){ return l.reduce(function(a, p){ return a + (Number(p.amount) || 0); }, 0); };
+  var h = '<div class="cwp-cards">' +
+    '<div class="cwp-card"><div class="n">' + pend.length + ' &bull; ' + money(sum(pend)) + '</div><div class="l">Pending — not sent</div></div>' +
+    '<div class="cwp-card"><div class="n">' + money(sum(sent.filter(function(p){ return String(p.sentDate || p.date).slice(0, 7) === month; }))) + '</div><div class="l">Sent this month</div></div>' +
+    '<div class="cwp-card"><div class="n">' + money(sum(sent)) + '</div><div class="l">Sent — all time</div></div>' +
+    '<div class="cwp-card"><div class="n">' + all.length + '</div><div class="l">Payments recorded</div></div></div>';
+  if(S.form) h += renderForm();
+  h += '<div class="esg-btns" style="margin-bottom:8px;">' + (S.form ? '' : '<button type="button" class="primary" data-cwp="new">+ New Payment</button>') +
+    '<button type="button" class="ghost" data-cwp="printlog">Print Payment Log</button><button type="button" class="ghost" data-cwp="csv">Export CSV</button></div>' +
+    '<div class="row"><div class="field" style="flex:2 1 260px;"><label for="cwpSearchList">Search payments</label><input type="text" id="cwpSearchList" placeholder="Payment ID, Case ID, name, confirmation..." value="' + E(S.q) + '" autocomplete="off"></div>' +
+    '<div class="field"><label for="cwpFilter">Status</label><select id="cwpFilter">' + opts(STATUSES, S.f, "All statuses") + '</select></div></div>';
+  var list = filtered();
+  h += list.length ? '<div style="overflow-x:auto;"><table class="cal-table"><thead><tr><th>Payment ID</th><th>Date</th><th>Case / Client</th><th>Amount</th><th>Purpose</th><th>Method</th><th>Status</th><th></th></tr></thead><tbody>' +
+    list.map(function(p){ return '<tr><td>' + E(p.id) + '</td><td>' + mdy(p.date) + '</td><td><b>' + E(p.caseRef) + '</b><br>' + E(p.client) + '</td><td>' + money(p.amount) + '</td><td>' + E(p.purpose) + '</td><td>' + E(p.method) + (p.last4 ? '<br><span class="field-note">' + E(p.bank) + ' ****' + E(p.last4) + '</span>' : '') + '</td><td><span class="cwp-st ' + stCls(p.status) + '">' + E(p.status) + '</span>' + (p.conf ? '<br><span class="field-note">#' + E(p.conf) + '</span>' : '') + '</td>' +
+      '<td class="cwp-actions">' + (/^PENDING/.test(p.status) ? '<button type="button" class="primary" data-cwp="sendone" data-arg="' + E(p.id) + '">Send</button>' : '') + '<button type="button" data-cwp="edit" data-arg="' + E(p.id) + '">Edit</button><button type="button" data-cwp="receipt" data-arg="' + E(p.id) + '">Receipt</button></td></tr>'; }).join("") +
+    '</tbody></table></div>' : '<p class="field-note">' + (all.length ? 'No payments match.' : 'No payments yet. Press <b>+ New Payment</b> to record one.') + '</p>';
+  return h;
+}
+function renderSend(){
+  var s = settings(), pend = payments().filter(function(p){ return /^PENDING/.test(p.status); }), h = '';
+  if(!s.myBank.url) h += '<div class="cwp-warn">Add your bank&rsquo;s website or app link in <b>Settings</b> (in this tab) so the <b>Open My Bank</b> button works.</div>';
+  if(!pend.length) return h + '<p class="field-note">No pending payments. Record one under <b>Payments</b> with status <b>PENDING — NOT SENT</b>, then come back here to send it.</p>';
+  h += '<div class="field"><label for="cwpSendPick">Payment to send</label><select id="cwpSendPick"><option value="">— pick a pending payment —</option>' +
+    pend.map(function(p){ return '<option value="' + E(p.id) + '"' + (p.id === S.sendId ? ' selected' : '') + '>' + E(p.id + " — " + (p.payee || p.client) + " — " + money(p.amount)) + '</option>'; }).join("") + '</select></div>';
+  var p = findPay(S.sendId); if(!p || !/^PENDING/.test(p.status)) return h;
+  var memo = p.id + " / " + p.caseRef + " / " + p.purpose;
+  h += '<fieldset><legend>Step 1 — Copy the details</legend><div class="cwp-big">' + money(p.amount) + '</div><table class="cwp-kv">' +
+    '<tr><td>Pay to</td><td><b>' + E(p.payee || p.client) + '</b></td></tr><tr><td>Method</td><td>' + E(p.method) + '</td></tr>' +
+    (p.zPhone ? '<tr><td>Zelle phone</td><td>' + E(phoneFmt(p.zPhone)) + '</td></tr>' : '') + (p.zEmail ? '<tr><td>Zelle email</td><td>' + E(p.zEmail) + '</td></tr>' : '') +
+    (p.bank || p.last4 ? '<tr><td>Client&rsquo;s bank</td><td>' + E(p.bank) + ' ' + E(p.acctType) + (p.last4 ? ' ending in ' + E(p.last4) : '') + '</td></tr>' : '') +
+    '<tr><td>Memo</td><td>' + E(memo) + '</td></tr><tr><td>Case</td><td>' + E(p.caseRef + " — " + p.client) + '</td></tr></table>' +
+    '<div class="esg-btns" style="margin-top:8px;"><button type="button" data-cwp="cp" data-arg="amount">Copy amount</button>' +
+    (p.zPhone ? '<button type="button" data-cwp="cp" data-arg="zphone">Copy Zelle phone</button>' : '') + (p.zEmail ? '<button type="button" data-cwp="cp" data-arg="zemail">Copy Zelle email</button>' : '') +
+    '<button type="button" data-cwp="cp" data-arg="payee">Copy name</button><button type="button" data-cwp="cp" data-arg="memo">Copy memo</button></div></fieldset>' +
+    '<fieldset><legend>Step 2 — Send it in your bank</legend>' +
+    (s.myBank.url ? '<a class="btn-like" href="' + E(s.myBank.url) + '" target="_blank" rel="noopener">Open My Bank' + (s.myBank.name ? ' — ' + E(s.myBank.name) : '') + '</a>' : '<span class="field-note">No bank link saved yet (Settings in this tab).</span>') +
+    '<p class="field-note" style="margin-top:6px;">Sign in to your bank, send ' + money(p.amount) + ' to ' + E(p.payee || p.client) + ', and paste the memo. Check the name and amount before you press Send in the bank app.</p></fieldset>' +
+    '<fieldset><legend>Step 3 — Record the confirmation</legend><div class="row">' +
+    '<div class="field"><label for="cwpConf">Bank confirmation No.</label><input type="text" id="cwpConf" autocomplete="off"></div>' +
+    '<div class="field"><label for="cwpSentDate">Date sent</label><input type="date" id="cwpSentDate" value="' + today() + '"></div></div>' +
+    '<button type="button" class="primary" data-cwp="marksent">Mark as Sent</button>' +
+    (s.caseNote === "yes" && p.caseKind === "dcm" ? ' <span class="field-note">A line will be added to this case&rsquo;s Case Manager Comments.</span>' : '') + '</fieldset>';
+  return h;
+}
+function renderSettings(){
+  var s = settings(), p = pub();
+  return '<fieldset><legend>One-time codes</legend><div class="field"><label for="cwpSTo">Send one-time codes to this email</label><input type="email" id="cwpSTo" value="' + E(sendTo()) + '"></div>' +
+    '<div class="field"><label for="cwpSAuto">Lock automatically after no use for</label><select id="cwpSAuto">' + [5, 10, 15, 30].map(function(n){ return '<option value="' + n + '"' + (s.autoLock === n ? ' selected' : '') + '>' + n + ' minutes</option>'; }).join("") + '</select></div></fieldset>' +
+    '<fieldset><legend>My bank (where payments come from)</legend><div class="row">' +
+    '<div class="field"><label for="cwpMyName">Bank name</label><input type="text" id="cwpMyName" value="' + E(s.myBank.name) + '"></div>' +
+    '<div class="field"><label for="cwpMyNick">Account nickname</label><input type="text" id="cwpMyNick" value="' + E(s.myBank.nick) + '"></div>' +
+    '<div class="field"><label for="cwpMyLast4">Account — last 4 digits only</label><input type="text" id="cwpMyLast4" maxlength="4" inputmode="numeric" value="' + E(s.myBank.last4) + '"></div></div>' +
+    '<div class="field"><label for="cwpMyUrl">Bank website or app link (for the Open My Bank button)</label><input type="url" id="cwpMyUrl" value="' + E(s.myBank.url) + '" placeholder="https://"></div>' +
+    '<div class="field-note">Your bank login, password and full account number are never saved here. You sign in to your bank yourself.</div></fieldset>' +
+    '<fieldset><legend>Dropdown lists (one per line)</legend><div class="row">' +
+    '<div class="field"><label for="cwpSBanks">Client banks</label><textarea id="cwpSBanks" class="cwp-list">' + E(s.banks.join("\n")) + '</textarea></div>' +
+    '<div class="field"><label for="cwpSPurp">Purposes</label><textarea id="cwpSPurp" class="cwp-list">' + E(s.purposes.join("\n")) + '</textarea></div></div><div class="row">' +
+    '<div class="field"><label for="cwpSSrc">Funding sources</label><textarea id="cwpSSrc" class="cwp-list">' + E(s.sources.join("\n")) + '</textarea></div>' +
+    '<div class="field"><label for="cwpSMeth">Payment methods</label><textarea id="cwpSMeth" class="cwp-list">' + E(s.methods.join("\n")) + '</textarea></div></div></fieldset>' +
+    '<fieldset><legend>Case notes</legend><div class="field"><label for="cwpSNote">When a payment is marked Sent, add a line to the case&rsquo;s Case Manager Comments</label><select id="cwpSNote"><option value="no"' + (s.caseNote !== "yes" ? " selected" : "") + '>No</option><option value="yes"' + (s.caseNote === "yes" ? " selected" : "") + '>Yes (Disaster Case Manager cases)</option></select></div></fieldset>' +
+    '<button type="button" class="primary" data-cwp="savesettings">Save Settings</button>' +
+    '<fieldset style="margin-top:14px;"><legend>Change passcode</legend><div class="row">' +
+    '<div class="field"><label for="cwpCur">Current passcode</label><input type="password" id="cwpCur" autocomplete="current-password"></div>' +
+    '<div class="field"><label for="cwpC1">New passcode</label><input type="password" id="cwpC1" autocomplete="new-password"></div>' +
+    '<div class="field"><label for="cwpC2">New passcode again</label><input type="password" id="cwpC2" autocomplete="new-password"></div></div>' +
+    '<button type="button" data-cwp="changepass">Change passcode</button></fieldset>' +
+    '<fieldset><legend>Recovery key</legend><p class="field-note">Make a new recovery key if the old one was lost or seen by someone. The old key stops working.</p>' +
+    '<div class="field"><label for="cwpCurR">Current passcode</label><input type="password" id="cwpCurR" autocomplete="current-password"></div><button type="button" data-cwp="newrec">Make a new recovery key</button></fieldset>' +
+    '<fieldset><legend>Backup</legend><p class="field-note">The backup file stays encrypted. It opens only with the passcode (or recovery key) in use when it was made.</p>' +
+    '<div class="esg-btns"><button type="button" data-cwp="backup">Download encrypted backup</button><label class="btn-like" style="cursor:pointer;">Restore a backup<input type="file" id="cwpRestore" accept=".json,application/json" style="display:none;"></label></div></fieldset>' +
+    '<fieldset><legend>Activity log</legend>' + (p.log.length ? '<div style="max-height:220px;overflow:auto;"><table class="cal-table"><tbody>' + p.log.map(function(l){ return '<tr><td style="white-space:nowrap;">' + E(new Date(l.t).toLocaleString()) + '</td><td>' + E(l.ev) + '</td></tr>'; }).join("") + '</tbody></table></div>' : '<p class="field-note">Nothing yet.</p>') +
+    '<button type="button" class="ghost" data-cwp="clearlog" style="margin-top:6px;">Clear Log</button></fieldset>';
+}
+function renderOpen(){
+  var t = function(k, l){ return '<button type="button" class="' + (S.tab === k ? 'on' : 'ghost') + '" data-cwp="tab" data-arg="' + k + '">' + l + '</button>'; };
+  var h = '<div class="cwp-sub">' + t("list", "Payments") + t("send", "Send a Payment") + t("settings", "Settings") + '<span class="cwp-sp"></span><button type="button" class="ghost" data-cwp="lock">&#128274; Lock now</button></div>' + msgs();
+  return h + (S.tab === "send" ? renderSend() : S.tab === "settings" ? renderSettings() : renderList());
+}
+function render(){
+  var v = $("viewClientPayments"); if(!v || v.style.display === "none") return;
+  var focus = document.activeElement && v.contains(document.activeElement) ? document.activeElement.id : "";
+  v.innerHTML = '<div class="page-head"><h1>Client Payments</h1><div class="sub">Record payments to clients and send them through your own bank. Locked with your passcode and a one-time email code.</div></div>' +
+    (S.unlocked ? renderOpen() : renderLocked());
+  var f = focus && $(focus);
+  if(f && f.tagName === "INPUT" && f.type !== "date"){ f.focus(); try{ f.setSelectionRange(f.value.length, f.value.length); }catch(e){} }
+  else if(!S.unlocked){ var first = $("cwpOtp") || $("cwpPass") || $("cwpRec") || $("cwpNew1"); if(first) try{ first.focus(); }catch(e){} }
+}
+
+/* ---------- events ---------- */
+function onPick(e){
+  var v = $("viewClientPayments"); if(!v || !v.contains(e.target)) return;
+  var sg = e.target.closest("[data-cwp-pick]");
+  if(sg){ e.preventDefault(); var t = S.sugg[+sg.getAttribute("data-cwp-pick")]; if(t && S.form){ readForm(); S.form.caseKey = t.key; S.form.caseKind = t.kind; S.form.caseId = t.caseId; S.form.caseRef = t.ref; S.form.program = t.program; S.form.client = up(t.name); if(!S.form.payee) S.form.payee = up(t.name); S.form.clientPhone = t.phone; } S.sugg = []; render(); return; }
+  var box = $("cwpSugg"); if(box && !e.target.closest("#cwpSugg, #cwpCaseSearch")) box.style.display = "none";
+}
+function onClick(e){
+  var v = $("viewClientPayments"); if(!v || !v.contains(e.target)) return;
+  var b = e.target.closest("[data-cwp]"); if(!b) return;
+  var a = b.getAttribute("data-cwp"), arg = b.getAttribute("data-arg");
+  if(a !== "cp") { S.msg = ""; S.bad = ""; }
+  switch(a){
+    case "setup": return doSetup();
+    case "pass": return doPass();
+    case "access": return doAccess();
+    case "resend": if(!S.pend){ S.step = "pass"; return render(); } return sendCode(true);
+    case "restart": S.pend = null; S.step = "pass"; return render();
+    case "forgotmode": S.mode = "forgot"; return render();
+    case "back": S.mode = ""; return render();
+    case "forgot": return doForgot();
+    case "erase": return doErase();
+    case "gosettings": return switchView("settings");
+    case "recprint": return printWin("Client Payments Recovery Key", '<h1>CLIENT PAYMENTS — RECOVERY KEY</h1><div class="org">Keep this paper in a safe place.</div><p style="font:700 26px Courier New,monospace;text-align:center;margin:30px 0;">' + E(S.showRec) + '</p><p>Use it in Client Payments &gt; Forgot passcode. Made ' + E(new Date().toLocaleString()) + '.</p>', false);
+    case "reccopy": return copy(S.showRec, "Recovery key");
+    case "recdone": S.showRec = ""; if(!S.unlocked){ S.step = "pass"; S.msg = "Set up is done. Type your passcode to open Client Payments."; } return render();
+    case "lock": log("Locked"); return lockNow("Locked.");
+    case "tab": S.tab = arg; S.form = null; return render();
+    case "new": S.form = formFrom(null); return render();
+    case "edit": S.tab = "list"; S.form = formFrom(findPay(arg)); render(); var v2 = $("viewClientPayments"); if(v2) v2.scrollIntoView({block:"start"}); return;
+    case "cancelform": S.form = null; return render();
+    case "savepay": return savePayment();
+    case "del": return deletePayment(arg);
+    case "receipt": return printReceipt(arg);
+    case "printlog": return printLog();
+    case "csv": return csv();
+    case "sendone": S.tab = "send"; S.sendId = arg; return render();
+    case "cp": var p = findPay(S.sendId); if(!p) return;
+      var m = {amount:[Number(p.amount).toFixed(2), "Amount"], zphone:[String(p.zPhone || "").replace(/\D/g, ""), "Zelle phone"], zemail:[p.zEmail, "Zelle email"], payee:[p.payee || p.client, "Name"], memo:[p.id + " / " + p.caseRef + " / " + p.purpose, "Memo"]}[arg];
+      return m ? copy(m[0], m[1]) : null;
+    case "marksent": return markSent();
+    case "savesettings": return saveSettings();
+    case "changepass": return changePass();
+    case "newrec": return newRecovery();
+    case "backup": return backup();
+    case "clearlog": var pp = pub(); pp.log = []; savePub(pp); return render();
+  }
+}
+function onInput(e){
+  var v = $("viewClientPayments"), el = e.target; if(!v || !v.contains(el)) return;
+  if(el.id === "cwpCaseSearch"){
+    if(e.type !== "input") return;
+    var term = el.value.trim().toUpperCase(), box = $("cwpSugg"); if(!box) return;
+    if(S.form && S.form.caseKey){ S.form.caseKey = ""; S.form.caseRef = ""; S.form.program = ""; }
+    if(!term){ box.style.display = "none"; return; }
+    S.sugg = targets().filter(function(t){ return (t.ref + " " + t.name + " " + t.program).toUpperCase().indexOf(term) >= 0; }).slice(0, 10);
+    box.innerHTML = S.sugg.length ? S.sugg.map(function(t, i){ return '<div class="cwp-sg" data-cwp-pick="' + i + '"><b>' + E(t.ref) + '</b> — ' + E(t.name) + ' <span class="field-note">' + E(t.program) + '</span></div>'; }).join("") : '<div class="cwp-sg" style="cursor:default;">No case or application matches.</div>';
+    box.style.display = "block"; return;
+  }
+  if(el.id === "cwpSearchList" && e.type === "input"){ S.q = el.value; var pos = el.selectionStart; render(); var n = $("cwpSearchList"); if(n){ n.focus(); try{ n.setSelectionRange(pos, pos); }catch(x){} } return; }
+  if(el.id === "cwpFilter" && e.type === "change"){ S.f = el.value; return render(); }
+  if(el.id === "cwpSendPick" && e.type === "change"){ S.sendId = el.value || null; S.msg = ""; S.bad = ""; return render(); }
+  if(el.id === "cwpRestore" && e.type === "change" && el.files && el.files[0]) return restore(el.files[0]);
+  if(el.id === "cwpLast4" || el.id === "cwpMyLast4"){ var d = el.value.replace(/\D/g, "").slice(0, 4); if(d !== el.value) el.value = d; }
+  if(el.id === "cwpOtp"){ var o = el.value.replace(/\D/g, "").slice(0, 6); if(o !== el.value) el.value = o; }
+  if(el.hasAttribute("data-f") && S.form) S.form[el.getAttribute("data-f")] = el.value;
+}
+function onKey(e){
+  if(e.key !== "Enter") return; var el = e.target, v = $("viewClientPayments"); if(!v || !v.contains(el) || el.tagName !== "INPUT") return;
+  var map = {cwpPass:"pass", cwpOtp:"access", cwpNew2:"setup", cwpTo:"setup", cwpF2:"forgot", cwpConf:"marksent"};
+  if(map[el.id]){ e.preventDefault(); var b = v.querySelector('[data-cwp="' + map[el.id] + '"]'); if(b) b.click(); }
+}
+function tick(){
+  if(S.unlocked){
+    var mins = settings().autoLock || 10;
+    if(Date.now() - S.lastAct > mins * 60000){ log("Locked automatically after " + mins + " minutes without use"); lockNow("Locked automatically after " + mins + " minutes without use."); }
+    return;
+  }
+  var c = $("cwpCountdown"); if(c){ var st = load(), o = st && st.otp; if(!o){ return; } var left = o.exp - Date.now(); c.textContent = left > 0 ? fmtLeft(left) : "expired"; }
+}
+
+/* ---------- hook-up ---------- */
+function init(){
+  var nav = $("dataTabWrap"), main = document.querySelector(".app-main-scroll");
+  if(!nav || !main || $("viewClientPayments") || typeof switchView !== "function") return;
+  var v = document.createElement("div"); v.id = "viewClientPayments"; v.style.display = "none"; main.appendChild(v);
+  var b = document.createElement("button"); b.type = "button"; b.setAttribute("data-view", "clientpay");
+  b.innerHTML = '<span class="nav-ic">&#128179;</span> Client Payments <span class="nav-badge" style="background:#5B3FA0;">&#128274;</span>';
+  b.addEventListener("click", function(){ switchView("clientpay"); });
+  var settingsBtn = nav.querySelector('button[data-view="settings"]');
+  if(settingsBtn && settingsBtn.parentNode) settingsBtn.parentNode.insertBefore(b, settingsBtn); else nav.appendChild(b);
+  var baseSwitch = switchView;
+  switchView = function(view){ baseSwitch(view); var el = $("viewClientPayments"); if(!el) return; el.style.display = view === "clientpay" ? "block" : "none"; if(view === "clientpay") render(); };
+  document.addEventListener("mousedown", onPick); document.addEventListener("click", onClick); document.addEventListener("input", onInput); document.addEventListener("change", onInput); document.addEventListener("keydown", onKey);
+  ["pointerdown", "keydown", "input", "scroll"].forEach(function(t){ document.addEventListener(t, function(){ if(S.unlocked) S.lastAct = Date.now(); }, true); });
+  document.addEventListener("visibilitychange", tick);
+  setInterval(tick, 1000);
+}
+function start(){ try{ init(); }catch(e){ console.error("Client Payments", e); } }
+if(/^#f=/.test(location.hash) && /[?&]fill(=|&|$)/.test(location.search)) return;   // client fill-in page: not part of it
+if(document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else setTimeout(start, 0);
+})();
+/* (added module -- END CLIENT PAYMENTS) */
+
 })();
 </script>
 <script>
@@ -33088,5 +33735,36 @@ try{ fpgqInit(); }catch(e){ console.error("FPG quick fill", e); }
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
 })();
 </script>
+<!-- (added module) Client Payments tab styles -->
+<style id="cwpayCss">
+#viewClientPayments .cwp-msg{background:#E6F4EA;border:1px solid #9BCBA8;border-radius:6px;padding:8px 10px;margin-bottom:12px;}
+#viewClientPayments .cwp-warn{background:#FFF4D6;border:1px solid #E8C66A;border-radius:6px;padding:8px 10px;margin-bottom:12px;font-size:13px;}
+#viewClientPayments .cwp-bad{background:#FDECEA;border:1px solid #F1A7A0;border-radius:6px;padding:8px 10px;margin-bottom:12px;color:#8C1D18;}
+#viewClientPayments .cwp-lockcard{max-width:460px;}
+#viewClientPayments .cwp-lockcard input{font-size:18px;letter-spacing:.08em;}
+#viewClientPayments .cwp-otp{font-size:24px !important;letter-spacing:.3em !important;text-align:center;max-width:220px;}
+#viewClientPayments .cwp-sub{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:12px;}
+#viewClientPayments .cwp-sub button.on{background:var(--navy,#12355B);color:#fff;border-color:var(--navy,#12355B);}
+#viewClientPayments .cwp-sub .cwp-sp{flex:1 1 auto;}
+#viewClientPayments .cwp-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px;}
+#viewClientPayments .cwp-card{border:1px solid var(--line,#D8E0E8);border-radius:6px;padding:8px 10px;background:#fff;}
+#viewClientPayments .cwp-card .n{font-size:18px;font-weight:700;color:var(--navy,#12355B);}
+#viewClientPayments .cwp-card .l{font-size:12px;color:#5C6B7A;}
+#viewClientPayments .cwp-sugg{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid var(--line,#D8E0E8);max-height:260px;overflow:auto;z-index:60;}
+#viewClientPayments .cwp-sg{padding:7px 10px;cursor:pointer;border-bottom:1px solid #EEF2F6;font-size:13px;}
+#viewClientPayments .cwp-sg:hover{background:#F4F7FA;}
+#viewClientPayments .cwp-st{display:inline-block;border-radius:10px;padding:1px 8px;font-size:11px;font-weight:700;white-space:nowrap;}
+#viewClientPayments .cwp-st.p{background:#FFF4D6;color:#8A5A00;}
+#viewClientPayments .cwp-st.s{background:#E3EEFA;color:#12355B;}
+#viewClientPayments .cwp-st.r{background:#E6F4EA;color:#1E7B34;}
+#viewClientPayments .cwp-st.x{background:#EEE;color:#555;}
+#viewClientPayments .cwp-big{font-size:28px;font-weight:700;color:var(--navy,#12355B);margin:4px 0 8px;}
+#viewClientPayments .cwp-kv td{padding:3px 10px 3px 0;vertical-align:top;font-size:14px;}
+#viewClientPayments .cwp-kv td:first-child{color:#5C6B7A;white-space:nowrap;}
+#viewClientPayments .cwp-rec{font:700 20px/1.4 "Courier New",monospace;letter-spacing:.06em;background:#F7FAFD;border:1px dashed #12355B;border-radius:6px;padding:10px;text-align:center;margin:8px 0;}
+#viewClientPayments .btn-like{display:inline-block;border:1px solid var(--navy,#12355B);color:var(--navy,#12355B);border-radius:4px;padding:7px 12px;text-decoration:none;font-weight:600;font-size:13px;}
+#viewClientPayments .cwp-actions button{padding:3px 8px;font-size:12px;margin:1px;}
+#viewClientPayments textarea.cwp-list{min-height:110px;}
+</style>
 </body>
 </html>
