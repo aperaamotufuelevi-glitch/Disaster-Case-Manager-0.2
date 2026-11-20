@@ -33817,5 +33817,38 @@ if(document.readyState === "loading") document.addEventListener("DOMContentLoade
 #viewClientPayments .cwp-actions button{padding:3px 8px;font-size:12px;margin:1px;}
 #viewClientPayments textarea.cwp-list{min-height:110px;}
 </style>
+<script>
+/* Sidebar order (added Nov 19, 2026 — owner's request): the Master Management System links
+   (Dashboard, Queue, Federal Poverty Guidelines, Document Verification, Client Fill-In Links,
+   Client Payments, Settings) sit under the Save Case / Document Templates / Quick Open Case /
+   Cloud Sync links; the Programs list comes first. Only moves existing buttons — nothing else changes. */
+(function(){
+  var ORDER = ["dashboard","queue","fpg","docverify","clientfill","clientpay","settings"];
+  if(!document.getElementById("mmsNavMoveCss")){
+    var st = document.createElement("style"); st.id = "mmsNavMoveCss";
+    st.textContent =
+      "#dataTabWrap > .sidebar-footer{margin:10px -10px 6px;padding:12px 14px 8px;border-top:1px solid #33454E;border-bottom:1px solid #33454E;}" +
+      "#dataTabWrap > .sidebar-footer button{width:100%;justify-content:center;text-align:center;}" +
+      "#dataTabWrap > .sidebar-footer #btnSaveTop{margin-bottom:8px;}" +
+      "#dataTabWrap > .sidebar-footer .ghost-list button{font-size:11.5px !important;padding:6px 10px !important;background:transparent;border:1px solid #465A63;color:#C7D1D6;}" +
+      "#dataTabWrap > .sidebar-footer .ghost-list button:hover{background:#22343D;color:#fff;}" +
+      "";
+    document.head.appendChild(st);
+  }
+  function arrange(){
+    var nav = document.getElementById("dataTabWrap"); if(!nav) return;
+    var foot = document.querySelector("#appSidebar .sidebar-footer");
+    if(!nav.querySelector('button[data-view="dashboard"]')) return;
+    if(foot) nav.appendChild(foot);
+    ORDER.forEach(function(v){
+      var b = nav.querySelector(':scope > button[data-view="' + v + '"]');
+      if(b) nav.appendChild(b);
+    });
+  }
+  function run(){ try{ arrange(); }catch(e){ console.error("nav order", e); } }
+  [0, 400, 1200, 3000, 6000, 12000].forEach(function(ms){ setTimeout(run, ms); });
+  if(document.readyState !== "complete") window.addEventListener("load", run);
+})();
+</script>
 </body>
 </html>
