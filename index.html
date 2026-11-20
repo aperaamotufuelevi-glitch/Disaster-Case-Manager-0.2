@@ -33838,7 +33838,9 @@ if(document.readyState === "loading") document.addEventListener("DOMContentLoade
       "#mmsBurgerMenu button.active{background:var(--focus,#2563EB);color:#fff;}" +
       "#mmsBurgerMenu button .nav-ic{width:18px;text-align:center;}" +
       "#mmsBurgerMenu .mms-bm-sep{border-top:1px solid #E3E8EB;margin:6px 4px;}" +
-      "#mmsBurgerMenu .mms-bm-side{font-weight:500;color:#51636D;font-size:12.5px;}";
+      "#mmsBurgerMenu .mms-bm-side{font-weight:500;color:#51636D;font-size:12.5px;}" +
+      /* Dashboard page: no empty space on both sides — starts right under the ☰ button and uses the full width */
+      ".app-main-scroll:has(> #viewDashboard:not([style*='none'])){max-width:none;margin:0;}";
     document.head.appendChild(st);
   }
   function realBtn(v){ var n = $("dataTabWrap"); return n ? n.querySelector('button[data-view="' + v + '"]') : null; }
