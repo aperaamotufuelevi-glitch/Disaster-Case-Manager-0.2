@@ -33817,77 +33817,9 @@ if(document.readyState === "loading") document.addEventListener("DOMContentLoade
 #viewClientPayments .cwp-actions button{padding:3px 8px;font-size:12px;margin:1px;}
 #viewClientPayments textarea.cwp-list{min-height:110px;}
 </style>
-<script>
-/* ☰ menu (added Nov 19, 2026 — owner's request): Dashboard and the other Master Management System
-   links (Queue, Federal Poverty Guidelines, Document Verification, Client Fill-In Links,
-   Client Payments, Settings) now open from the ☰ button at the top left. The original sidebar
-   buttons stay in the page (hidden) and the menu simply clicks them, so every page works as before.
-   "Show / hide side menu" in the ☰ menu keeps the button's old job. */
-(function(){
-  var ORDER = ["dashboard","queue","fpg","docverify","clientfill","clientpay","settings"];
-  var passThru = false;
-  function $(id){ return document.getElementById(id); }
-  if(!$("mmsBurgerCss")){
-    var st = document.createElement("style"); st.id = "mmsBurgerCss";
-    st.textContent =
-      "#dataTabWrap > button.mms-in-burger{display:none !important;}" +
-      "#mmsBurgerMenu{position:fixed;z-index:9999;min-width:250px;background:#fff;border:1px solid #D5DCE0;border-radius:8px;box-shadow:0 10px 28px rgba(0,0,0,.18);padding:6px;display:none;}" +
-      "#mmsBurgerMenu.open{display:block;}" +
-      "#mmsBurgerMenu button{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:transparent;border:none;color:#1B2A33;padding:9px 12px;border-radius:6px;font-size:13.5px;font-weight:600;cursor:pointer;}" +
-      "#mmsBurgerMenu button:hover{background:#EEF3F6;}" +
-      "#mmsBurgerMenu button.active{background:var(--focus,#2563EB);color:#fff;}" +
-      "#mmsBurgerMenu button .nav-ic{width:18px;text-align:center;}" +
-      "#mmsBurgerMenu .mms-bm-sep{border-top:1px solid #E3E8EB;margin:6px 4px;}" +
-      "#mmsBurgerMenu .mms-bm-side{font-weight:500;color:#51636D;font-size:12.5px;}" +
-      /* Dashboard page: moved to the left so it starts right under the ☰ button (same size as before) */
-      ".app-main-scroll:has(> #viewDashboard:not([style*='none'])){margin-left:0;}";
-    document.head.appendChild(st);
-  }
-  function realBtn(v){ var n = $("dataTabWrap"); return n ? n.querySelector('button[data-view="' + v + '"]') : null; }
-  function hideInSidebar(){ ORDER.forEach(function(v){ var b = realBtn(v); if(b) b.classList.add("mms-in-burger"); }); }
-  function menu(){
-    var m = $("mmsBurgerMenu");
-    if(!m){ m = document.createElement("div"); m.id = "mmsBurgerMenu"; m.setAttribute("role","menu"); document.body.appendChild(m); }
-    return m;
-  }
-  function closeMenu(){ var m = $("mmsBurgerMenu"); if(m) m.classList.remove("open"); }
-  function openMenu(btn){
-    hideInSidebar();
-    var m = menu(); m.innerHTML = "";
-    ORDER.forEach(function(v){
-      var b = realBtn(v); if(!b) return;
-      var it = document.createElement("button"); it.type = "button"; it.setAttribute("role","menuitem");
-      it.innerHTML = b.innerHTML;
-      if(b.classList.contains("active")) it.classList.add("active");
-      it.addEventListener("click", function(){ closeMenu(); b.click(); });
-      m.appendChild(it);
-    });
-    var sep = document.createElement("div"); sep.className = "mms-bm-sep"; m.appendChild(sep);
-    var side = document.createElement("button"); side.type = "button"; side.className = "mms-bm-side";
-    side.innerHTML = '<span class="nav-ic">&#9776;</span> Show / hide side menu';
-    side.addEventListener("click", function(){ closeMenu(); passThru = true; try{ btn.click(); } finally { passThru = false; } });
-    m.appendChild(side);
-    var r = btn.getBoundingClientRect();
-    m.style.left = Math.max(6, r.left) + "px"; m.style.top = (r.bottom + 6) + "px";
-    m.style.maxHeight = (window.innerHeight - r.bottom - 16) + "px"; m.style.overflowY = "auto";
-    m.classList.add("open");
-  }
-  window.addEventListener("click", function(e){
-    var btn = e.target && e.target.closest && e.target.closest("#btnSidebarToggle");
-    if(btn && !passThru){
-      e.preventDefault(); e.stopImmediatePropagation();
-      var m = $("mmsBurgerMenu");
-      if(m && m.classList.contains("open")) closeMenu(); else openMenu(btn);
-      return;
-    }
-    if(!(e.target && e.target.closest && e.target.closest("#mmsBurgerMenu"))) closeMenu();
-  }, true);
-  document.addEventListener("keydown", function(e){ if(e.key === "Escape") closeMenu(); });
-  window.addEventListener("resize", closeMenu);
-  function run(){ try{ hideInSidebar(); }catch(e){ console.error("burger menu", e); } }
-  [0, 400, 1200, 3000, 6000, 12000].forEach(function(ms){ setTimeout(run, ms); });
-  if(document.readyState !== "complete") window.addEventListener("load", run);
-})();
-</script>
+<style id="mmsDashLeftCss">
+/* Dashboard page: moved to the left so it starts right under the ☰ button (same size as before). Added Nov 19, 2026. */
+.app-main-scroll:has(> #viewDashboard:not([style*='none'])){margin-left:0;}
+</style>
 </body>
 </html>
